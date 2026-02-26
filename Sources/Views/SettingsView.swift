@@ -27,8 +27,13 @@ struct SettingsView: View {
                 .tabItem {
                     Label("Sync", systemImage: "arrow.triangle.2.circlepath")
                 }
+
+            RemoteControlSettingsView()
+                .tabItem {
+                    Label("Remote", systemImage: "antenna.radiowaves.left.and.right")
+                }
         }
-        .frame(width: 500, height: 400)
+        .frame(width: 500, height: 450)
     }
 }
 
@@ -370,6 +375,102 @@ struct SyncSettingsView: View {
         let container = FileManager.default.url(forUbiquityContainerIdentifier: nil)
         await MainActor.run {
             iCloudStatus = container != nil ? "Available" : "Not available"
+        }
+    }
+}
+
+struct RemoteControlSettingsView: View {
+    @Environment(AppState.self) private var appState
+
+    var body: some View {
+        @Bindable var state = appState
+
+        Form {
+            Section("Server") {
+                Toggle("Enable remote control", isOn: $state.settings.remoteControlEnabled)
+
+                HStack {
+                    Text("Port")
+                    Spacer()
+                    TextField("Port", value: $state.settings.remoteControlPort, format: .number)
+                        .frame(width: 80)
+                        .multilineTextAlignment(.trailing)
+                }
+                .disabled(!appState.settings.remoteControlEnabled)
+
+                HStack {
+                    Text("API Key")
+                    Spacer()
+                    SecureField("Optional", text: $state.settings.remoteControlApiKey)
+                        .frame(width: 180)
+                        .multilineTextAlignment(.trailing)
+                }
+                .disabled(!appState.settings.remoteControlEnabled)
+
+                HStack {
+                    Text("Status")
+                    Spacer()
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(appState.remoteControlService.isRunning ? .green : .gray)
+                            .frame(width: 8, height: 8)
+                        Text(appState.remoteControlService.isRunning ? "Running on port \(appState.settings.remoteControlPort)" : "Stopped")
+                            .foregroundStyle(appState.remoteControlService.isRunning ? .primary : .secondary)
+                    }
+                }
+
+                if appState.settings.remoteControlEnabled {
+                    Button(appState.remoteControlService.isRunning ? "Restart Server" : "Start Server") {
+                        appState.restartRemoteControl()
+                    }
+                }
+            }
+
+            Section("Recent Requests") {
+                if appState.remoteControlService.recentRequests.isEmpty {
+                    Text("No requests yet")
+                        .foregroundStyle(.secondary)
+                        .font(.caption)
+                } else {
+                    ForEach(appState.remoteControlService.recentRequests.prefix(10)) { entry in
+                        HStack {
+                            Text(entry.method)
+                                .font(.system(size: 10, design: .monospaced))
+                                .fontWeight(.bold)
+                                .foregroundStyle(entry.statusCode < 400 ? .green : .red)
+                                .frame(width: 45, alignment: .leading)
+                            Text(entry.path)
+                                .font(.system(size: 10, design: .monospaced))
+                                .lineLimit(1)
+                            Spacer()
+                            Text("\(entry.statusCode)")
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(entry.statusCode < 400 ? .secondary : .red)
+                        }
+                    }
+                }
+            }
+
+            Section("About") {
+                Text("Remote control exposes a local HTTP API on the configured port, allowing external tools and scripts to read and modify documents, manage tabs, and control the editor.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .onChange(of: appState.settings.remoteControlEnabled) { _, enabled in
+            if enabled {
+                appState.startRemoteControl()
+            } else {
+                appState.stopRemoteControl()
+            }
+            appState.saveUserData()
+        }
+        .onChange(of: appState.settings.remoteControlPort) { _, _ in
+            appState.saveUserData()
+        }
+        .onChange(of: appState.settings.remoteControlApiKey) { _, _ in
+            appState.saveUserData()
         }
     }
 }

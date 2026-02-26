@@ -294,6 +294,11 @@ struct AppSettings: Codable, Equatable {
     var restoreLastSession: Bool = true
     var confirmBeforeClosingDirtyTabs: Bool = true
     var scrollSyncEnabled: Bool = true
+
+    // Remote Control
+    var remoteControlEnabled: Bool = false
+    var remoteControlPort: Int = 51707
+    var remoteControlApiKey: String = ""
 }
 
 // MARK: - File Tree Item
@@ -459,6 +464,7 @@ final class AppState {
     private let vaultService: VaultService
     private let draftService: DraftService
     private let exportService: ExportService
+    let remoteControlService = RemoteControlService()
     private let dataURL: URL
     private var fileWatchers: [UUID: DispatchSourceFileSystemObject] = [:]
     
@@ -522,6 +528,27 @@ final class AppState {
             queue: .main
         ) { [weak self] _ in
             self?.showQuickCapture = true
+        }
+
+        if settings.remoteControlEnabled {
+            startRemoteControl()
+        }
+    }
+
+    func startRemoteControl() {
+        let port = UInt16(clamping: settings.remoteControlPort)
+        let key = settings.remoteControlApiKey.isEmpty ? nil : settings.remoteControlApiKey
+        remoteControlService.start(appState: self, port: port, apiKey: key)
+    }
+
+    func stopRemoteControl() {
+        remoteControlService.stop()
+    }
+
+    func restartRemoteControl() {
+        stopRemoteControl()
+        if settings.remoteControlEnabled {
+            startRemoteControl()
         }
     }
     
