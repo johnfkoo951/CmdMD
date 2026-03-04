@@ -1,0 +1,35 @@
+name: "Release"
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-release:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Swift
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "5.9"
+
+      - name: Build Release
+        run: swift build --configuration release
+
+      - name: Package Binary
+        run: |
+          mkdir -p dist
+          cp .build/release/CmdMD dist/
+          cd dist && zip CmdMD-macos.zip CmdMD
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/CmdMD-macos.zip
+          generate_release_notes: true
