@@ -8,15 +8,16 @@ on:
 
 jobs:
   build:
-    runs-on: macos-latest
+    # Use the runner's native Swift toolchain (matches the release workflow).
+    # The pinned swift-actions/setup-swift @ 5.9 crashed building Yams' module
+    # interface; the modern runner toolchain builds the package cleanly.
+    runs-on: macos-15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Swift
-        uses: swift-actions/setup-swift@v2
-        with:
-          swift-version: "5.9"
+      - name: Swift version
+        run: swift --version
 
       - name: Build (Debug)
         run: swift build
@@ -25,4 +26,4 @@ jobs:
         run: swift build --configuration release
 
       - name: Run Tests
-        run: swift test 2>&1 || echo "No tests found (skipping)"
+        run: swift test
