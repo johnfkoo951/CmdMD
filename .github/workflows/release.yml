@@ -17,8 +17,13 @@ jobs:
       - name: Package and Validate App Bundle
         run: scripts/test_package_app.sh
 
+      - name: Build DMG
+        run: scripts/make_dmg.sh
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/CmdMD-macos.zip
+          files: |
+            dist/CmdMD-macos.zip
+            dist/CmdMD-*.dmg
           generate_release_notes: true

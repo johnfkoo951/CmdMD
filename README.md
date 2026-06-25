@@ -60,8 +60,10 @@ then file it into the correct vault folder with templates and rules.
 
 ### Download (recommended)
 
-Grab the latest `CmdMD-macos.zip` from the [**Releases**](../../releases) page, unzip, and move
-`CmdMD.app` to `/Applications`.
+Grab the latest build from the [**Releases**](../../releases) page:
+
+- **`CmdMD-<version>.dmg`** — open it and drag `CmdMD.app` onto the **Applications** shortcut.
+- **`CmdMD-macos.zip`** — unzip and move `CmdMD.app` to `/Applications` (same thing, no mount).
 
 The app is **ad‑hoc signed**, so on first launch Gatekeeper may warn. Either right‑click →
 **Open**, or clear the quarantine flag:
