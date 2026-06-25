@@ -20,6 +20,12 @@ struct CmdMDApp: App {
         .windowToolbarStyle(.unified(showsTitle: false))
         .defaultSize(width: appState.settings.defaultWindowWidth, height: appState.settings.defaultWindowHeight)
         .commands {
+            CommandGroup(replacing: .appInfo) {
+                Button("About CmdMD") {
+                    appState.showAbout = true
+                }
+            }
+
             CommandGroup(replacing: .newItem) {
                 Button("New Draft") {
                     appState.createNewDraft()

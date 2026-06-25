@@ -6,6 +6,9 @@ struct CommandPaletteView: View {
 
     @State private var searchText: String = ""
     @State private var selectedIndex: Int = 0
+    /// True when the highlight last moved via the keyboard. Auto-scroll only
+    /// follows keyboard navigation, so hovering never yanks the list under the cursor.
+    @State private var navigatingByKeyboard = false
     @FocusState private var isSearchFocused: Bool
 
     var filteredCommands: [Command] {
@@ -66,6 +69,13 @@ struct CommandPaletteView: View {
                                 isSelected: index == selectedIndex
                             )
                             .id(index)
+                            .contentShape(Rectangle())
+                            .onHover { hovering in
+                                if hovering {
+                                    navigatingByKeyboard = false
+                                    selectedIndex = index
+                                }
+                            }
                             .onTapGesture {
                                 selectedIndex = index
                                 executeSelectedCommand()
@@ -75,6 +85,7 @@ struct CommandPaletteView: View {
                     .padding(.vertical, 8)
                 }
                 .onChange(of: selectedIndex) { _, newIndex in
+                    guard navigatingByKeyboard else { return }
                     withAnimation {
                         proxy.scrollTo(newIndex, anchor: .center)
                     }
@@ -91,12 +102,14 @@ struct CommandPaletteView: View {
         }
         .onKeyPress(.upArrow) {
             if selectedIndex > 0 {
+                navigatingByKeyboard = true
                 selectedIndex -= 1
             }
             return .handled
         }
         .onKeyPress(.downArrow) {
             if selectedIndex < filteredCommands.count - 1 {
+                navigatingByKeyboard = true
                 selectedIndex += 1
             }
             return .handled

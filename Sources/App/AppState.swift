@@ -43,6 +43,7 @@ final class AppState {
     var showVaultManager: Bool = false
     var showQuickCapture: Bool = false
     var showOmnisearch: Bool = false
+    var showAbout: Bool = false
     /// Editor/preview width ratio in split view (runtime-only).
     var splitFraction: CGFloat = 0.5
     /// Non-empty while the Send sheet is operating on a batch of files
@@ -420,7 +421,7 @@ final class AppState {
 
         let source = DispatchSource.makeFileSystemObjectSource(
             fileDescriptor: fileDescriptor,
-            eventMask: [.write, .rename, .delete],
+            eventMask: [.write, .extend, .rename, .delete],
             queue: .main
         )
 
@@ -451,37 +452,63 @@ final class AppState {
     private func handleExternalFileChange(at url: URL, event: DispatchSource.FileSystemEvent) {
         guard let tab = tabs.first(where: { $0.fileURL == url }) else { return }
 
-        if event.contains(.delete) {
-            showToast("File was deleted externally")
-            if var doc = documents[tab.documentId] {
-                doc.fileURL = nil
-                documents[tab.documentId] = doc
-            }
-            stopWatchingFile(for: tab.id)
-            return
-        }
-
-        if event.contains(.rename) {
-            showToast("File was renamed externally")
-            stopWatchingFile(for: tab.id)
-            return
-        }
-
-        if event.contains(.write) {
-            guard !isTabDirty(tab) else {
-                showToast("File changed externally - save to overwrite or reload")
-                return
-            }
-
-            Task { @MainActor in
-                do {
-                    let document = try await fileService.loadDocument(from: url)
-                    documents[tab.documentId] = document
-                    originalContents[tab.documentId] = document.fullText
-                    showToast("Reloaded from disk")
-                } catch {
-                    errorMessage = "Failed to reload file: \(error.localizedDescription)"
+        // Atomic saves (Obsidian, vim, VS Code, and most editors) write to a temp
+        // file then rename it over the original. That swaps the inode, so the
+        // watched fd — bound to the OLD inode — receives .rename/.delete (never
+        // .write) and stops seeing changes. So on rename/delete we re-resolve the
+        // path and re-arm the watch on the new file, which is why external edits
+        // now reflect instead of going silent.
+        if event.contains(.rename) || event.contains(.delete) {
+            stopWatchingFile(for: tab.id)   // close the stale descriptor
+            // Brief delay so the atomic replacement is fully in place.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                guard let self, let tab = self.tabs.first(where: { $0.fileURL == url }) else { return }
+                if FileManager.default.fileExists(atPath: url.path) {
+                    self.startWatchingFile(at: url, for: tab.id)   // re-arm on the new inode
+                    self.reloadExternally(url: url, tab: tab)
+                } else {
+                    self.showToast("File was removed externally")
+                    if var doc = self.documents[tab.documentId] {
+                        doc.fileURL = nil
+                        self.documents[tab.documentId] = doc
+                    }
+                    if let index = self.tabs.firstIndex(where: { $0.id == tab.id }) {
+                        self.tabs[index].fileURL = nil
+                    }
                 }
+            }
+            return
+        }
+
+        if event.contains(.write) || event.contains(.extend) {
+            reloadExternally(url: url, tab: tab)
+        }
+    }
+
+    /// Reloads a tab's content from disk after an external change, preserving the
+    /// document's identity (so scroll/selection survive). Won't clobber unsaved
+    /// in-app edits — those get a toast prompting a manual reload instead.
+    private func reloadExternally(url: URL, tab: EditorTab) {
+        guard !isTabDirty(tab) else {
+            showToast("File changed externally — ⌥⌘R to reload")
+            return
+        }
+        Task { @MainActor in
+            do {
+                let fresh = try await fileService.loadDocument(from: url)
+                if var existing = documents[tab.documentId] {
+                    existing.content = fresh.content
+                    existing.frontmatter = fresh.frontmatter
+                    existing.modifiedAt = Date()
+                    documents[tab.documentId] = existing
+                    originalContents[tab.documentId] = existing.fullText
+                } else {
+                    documents[tab.documentId] = fresh
+                    originalContents[tab.documentId] = fresh.fullText
+                }
+                showToast("Reloaded from disk")
+            } catch {
+                errorMessage = "Failed to reload file: \(error.localizedDescription)"
             }
         }
     }

@@ -46,13 +46,9 @@ struct ContentView: View {
 
             ToolbarItemGroup(placement: .primaryAction) {
                 SendToVaultButton()
-
-                Button {
-                    appState.inspectorVisible.toggle()
-                } label: {
-                    Image(systemName: "sidebar.right")
-                }
-                .help("Toggle Inspector (\(appState.keyBinding(for: .toggleInspector).displayString))")
+                // The inspector toggle is provided automatically by `.inspector`
+                // at the trailing edge — a second custom button here produced the
+                // stray duplicate control at the top-right.
             }
         }
         .sheet(isPresented: $state.showSendToVault, onDismiss: {
@@ -82,6 +78,9 @@ struct ContentView: View {
         )) {
             OnboardingView()
                 .interactiveDismissDisabled(true)
+        }
+        .sheet(isPresented: $state.showAbout) {
+            AboutView()
         }
         .alert(
             "Something went wrong",
@@ -315,6 +314,80 @@ struct WindowAccessor: NSViewRepresentable {
         if window == nil {
             DispatchQueue.main.async { window = nsView.window }
         }
+    }
+}
+
+// MARK: - About / creator info
+
+enum AppInfo {
+    static var version: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.4.2"
+    }
+    static var build: String {
+        Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? ""
+    }
+    static var versionLabel: String {
+        build.isEmpty ? "Version \(version)" : "Version \(version) (\(build))"
+    }
+    static let maker = "구요한 · CMDSPACE"
+    static let website = URL(string: "https://cmdspace.work")!
+    static let github = URL(string: "https://github.com/johnfkoo951/CmdMD")!
+}
+
+/// Shared row of brand links — reused by the About window and Settings.
+struct CreatorLinks: View {
+    var body: some View {
+        HStack(spacing: 16) {
+            Link(destination: AppInfo.website) {
+                Label("cmdspace.work", systemImage: "globe")
+            }
+            Link(destination: AppInfo.github) {
+                Label("GitHub", systemImage: "chevron.left.forwardslash.chevron.right")
+            }
+        }
+        .font(.callout)
+        .tint(.cmdsAccent)
+    }
+}
+
+struct AboutView: View {
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(spacing: 16) {
+            BrandLogo(size: 76, showWordmark: true)
+
+            VStack(spacing: 3) {
+                Text("CmdMD")
+                    .font(.title2.bold())
+                Text(AppInfo.versionLabel)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Text("A review-first Markdown editor & Obsidian vault router.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+
+            Divider().frame(width: 220)
+
+            VStack(spacing: 8) {
+                Text("Made by \(AppInfo.maker)")
+                    .font(.callout.weight(.medium))
+                CreatorLinks()
+            }
+
+            Text("© 2026 CMDSPACE · MIT License")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+
+            Button("Done") { dismiss() }
+                .keyboardShortcut(.defaultAction)
+        }
+        .padding(28)
+        .frame(width: 360)
+        .tint(.cmdsAccent)
     }
 }
 

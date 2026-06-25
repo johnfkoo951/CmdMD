@@ -106,6 +106,23 @@ struct GeneralSettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+
+            Section {
+                LabeledContent("Version", value: AppInfo.versionLabel)
+                LabeledContent("Made by", value: AppInfo.maker)
+                Link(destination: AppInfo.website) {
+                    Label("cmdspace.work", systemImage: "globe")
+                }
+                Link(destination: AppInfo.github) {
+                    Label("GitHub repository", systemImage: "chevron.left.forwardslash.chevron.right")
+                }
+                Button("About CmdMD…") { appState.showAbout = true }
+            } header: {
+                Text("About")
+            } footer: {
+                Text("CmdMD · © 2026 CMDSPACE · MIT License")
+                    .font(.caption)
+            }
         }
         .formStyle(.grouped)
         .onChange(of: appState.settings) { _, _ in

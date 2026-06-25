@@ -10,6 +10,8 @@ struct OmnisearchView: View {
 
     @State private var query: String = ""
     @State private var selectedIndex: Int = 0
+    /// Auto-scroll follows keyboard navigation only, so hovering doesn't jump the list.
+    @State private var navigatingByKeyboard = false
     @State private var contentResults: [SearchResult] = []
     @State private var isSearchingContent = false
     @State private var contentSearchTask: Task<Void, Never>?
@@ -139,6 +141,12 @@ struct OmnisearchView: View {
                                 }
                                 OmnisearchRow(hit: hit, isSelected: index == selectedIndex)
                                     .id(index)
+                                    .onHover { hovering in
+                                        if hovering {
+                                            navigatingByKeyboard = false
+                                            selectedIndex = index
+                                        }
+                                    }
                                     .onTapGesture {
                                         open(at: index, in: hits)
                                     }
@@ -147,6 +155,7 @@ struct OmnisearchView: View {
                         .padding(.vertical, 6)
                     }
                     .onChange(of: selectedIndex) { _, newIndex in
+                        guard navigatingByKeyboard else { return }
                         withAnimation {
                             proxy.scrollTo(newIndex, anchor: .center)
                         }
