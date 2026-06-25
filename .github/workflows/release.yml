@@ -10,6 +10,10 @@ jobs:
     runs-on: macos-15
     permissions:
       contents: write
+    env:
+      # 'true' once Developer ID signing secrets are configured; until then the
+      # release ships ad-hoc signed (no notarization) exactly as before.
+      HAS_SIGNING: ${{ secrets.MACOS_CERTIFICATE != '' && secrets.MACOS_NOTARY_APPLE_ID != '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -29,8 +33,23 @@ jobs:
       - name: Package and Validate App Bundle
         run: scripts/test_package_app.sh
 
-      - name: Build DMG
+      # Ad-hoc path (no signing secrets): just build the DMG.
+      - name: Build DMG (ad-hoc)
+        if: env.HAS_SIGNING != 'true'
         run: scripts/make_dmg.sh
+
+      # Notarized path (signing secrets present): Developer ID sign + notarize +
+      # staple, rebuilding both the zip and DMG from the signed/stapled app.
+      - name: Sign, notarize & staple (Developer ID)
+        if: env.HAS_SIGNING == 'true'
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          MACOS_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+          MACOS_NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
+          MACOS_NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+        run: scripts/sign_and_notarize.sh
 
       - name: Generate checksums
         run: |

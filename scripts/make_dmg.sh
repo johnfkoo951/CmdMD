@@ -34,8 +34,9 @@ hdiutil create \
   -ov \
   "$DMG" >/dev/null
 
-# Ad-hoc sign the DMG so Gatekeeper shows a cleaner (still unidentified) prompt.
-codesign --force --sign - "$DMG" 2>/dev/null || true
+# Note: the DMG is intentionally left unsigned here. For notarized releases the
+# app inside is Developer ID signed and the DMG is stapled by sign_and_notarize.sh
+# (an ad-hoc DMG signature would add no Gatekeeper value and can fight stapling).
 
 SIZE="$(du -h "$DMG" | cut -f1)"
 echo "==> Created $DMG ($SIZE)"
