@@ -620,12 +620,27 @@ class MarkdownRenderer {
             "h1, h2, h3, h4, h5, h6 { color: \(htmlEscape($0)); }"
         } ?? ""
 
+        // 장평 (horizontal glyph scale). CSS has no reflow-safe width property for
+        // non-variable fonts, so scaleX the text blocks (tables/code/images keep
+        // normal width). Only emitted when changed, so the default is a true no-op.
+        let charWidthRule = abs(p.charWidth - 1.0) > 0.001 ? """
+        .markdown-body p, .markdown-body li,
+        .markdown-body h1, .markdown-body h2, .markdown-body h3,
+        .markdown-body h4, .markdown-body h5, .markdown-body h6,
+        .markdown-body blockquote {
+            transform: scaleX(\(String(format: "%.3f", p.charWidth)));
+            transform-origin: left center;
+        }
+        """ : ""
+
         return """
         body {
             font-family: \(p.fontFamily);
             font-size: \(Int(p.fontSize))px;
             line-height: \(String(format: "%.2f", p.lineHeight));
             max-width: \(Int(p.maxWidth))px;
+            letter-spacing: \(String(format: "%.3f", p.letterSpacing))em;
+            word-spacing: \(String(format: "%.3f", p.wordSpacing))em;
         }
         h1, h2, h3, h4, h5, h6 {
             margin-top: \(Int(p.headingMarginTop))px;
@@ -633,6 +648,7 @@ class MarkdownRenderer {
         }
         \(headingRules)
         \(headingColorRule)
+        \(charWidthRule)
         \(p.customCSS)
         """
     }

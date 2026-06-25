@@ -14,6 +14,13 @@ struct PreviewSettings: Codable, Equatable {
     var maxWidth: CGFloat = 800
     var fontFamily: String = "system-ui"
     var fontSize: CGFloat = 16
+    /// 자간 — letter spacing in em.
+    var letterSpacing: CGFloat = 0
+    /// 단어 간격 — word spacing in em.
+    var wordSpacing: CGFloat = 0
+    /// 장평 — horizontal glyph scale (1.0 = normal). Applied via scaleX since CSS
+    /// has no reflow-safe width property for non-variable fonts.
+    var charWidth: CGFloat = 1.0
 
     /// The heading color to inject, or nil to keep the theme default. "#333333"
     /// was an old default that was never applied; honoring it now would break
@@ -42,6 +49,9 @@ struct PreviewSettings: Codable, Equatable {
         maxWidth = try c.decodeIfPresent(CGFloat.self, forKey: .maxWidth) ?? d.maxWidth
         fontFamily = try c.decodeIfPresent(String.self, forKey: .fontFamily) ?? d.fontFamily
         fontSize = try c.decodeIfPresent(CGFloat.self, forKey: .fontSize) ?? d.fontSize
+        letterSpacing = try c.decodeIfPresent(CGFloat.self, forKey: .letterSpacing) ?? d.letterSpacing
+        wordSpacing = try c.decodeIfPresent(CGFloat.self, forKey: .wordSpacing) ?? d.wordSpacing
+        charWidth = try c.decodeIfPresent(CGFloat.self, forKey: .charWidth) ?? d.charWidth
     }
 }
 

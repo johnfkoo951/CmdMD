@@ -213,7 +213,7 @@ struct OnboardingView: View {
     var body: some View {
         VStack(spacing: 24) {
             VStack(spacing: 14) {
-                BrandLogo(size: 84)
+                BrandLogo(size: 84, showWordmark: true)
 
                 VStack(spacing: 4) {
                     Text("Welcome to CmdMD")

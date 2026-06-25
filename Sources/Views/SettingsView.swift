@@ -253,6 +253,30 @@ struct PreviewSettingsView: View {
                     Text("Inter").tag("Inter, sans-serif")
                     Text("SF Pro Text").tag("SF Pro Text, sans-serif")
                 }
+
+                HStack {
+                    Text("Letter spacing (자간)")
+                    Slider(value: $state.settings.previewSettings.letterSpacing, in: -0.05...0.3, step: 0.01)
+                    Text(String(format: "%.2f em", appState.settings.previewSettings.letterSpacing))
+                        .monospacedDigit()
+                        .frame(width: 64, alignment: .trailing)
+                }
+
+                HStack {
+                    Text("Character width (장평)")
+                    Slider(value: $state.settings.previewSettings.charWidth, in: 0.8...1.2, step: 0.01)
+                    Text(String(format: "%.0f%%", appState.settings.previewSettings.charWidth * 100))
+                        .monospacedDigit()
+                        .frame(width: 64, alignment: .trailing)
+                }
+
+                HStack {
+                    Text("Word spacing (단어 간격)")
+                    Slider(value: $state.settings.previewSettings.wordSpacing, in: 0...1, step: 0.05)
+                    Text(String(format: "%.2f em", appState.settings.previewSettings.wordSpacing))
+                        .monospacedDigit()
+                        .frame(width: 64, alignment: .trailing)
+                }
             }
 
             Section("Headings") {

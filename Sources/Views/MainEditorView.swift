@@ -387,7 +387,7 @@ struct WelcomeView: View {
 
                     // Hero
                     VStack(spacing: 14) {
-                        BrandLogo(size: 92)
+                        BrandLogo(size: 92, showWordmark: true)
 
                         VStack(spacing: 4) {
                             Text("CmdMD")
