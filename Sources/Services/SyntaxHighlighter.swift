@@ -6,8 +6,39 @@ class SyntaxHighlighter {
     /// Highlightr boots a JavaScript engine on init — expensive. One shared
     /// instance serves every editor; the active theme is tracked so repeated
     /// highlight passes don't re-load the theme JSON.
-    private static let sharedHighlightr: Highlightr? = Highlightr()
+    private static let sharedHighlightr: Highlightr? = SyntaxHighlighter.makeHighlightr()
     private static var activeHighlightrTheme: String = ""
+
+    /// `Highlightr()` reaches for its SwiftPM resource bundle
+    /// (`Highlightr_Highlightr.bundle` — highlight.js + CSS themes) through the
+    /// synthesized `Bundle.module` accessor, which **traps** (not throws) when the
+    /// bundle was not shipped next to the app. That is exactly what crashed 1.4.6.
+    /// Probe for the bundle first so a mis-packaged build degrades to "no code
+    /// highlighting" instead of taking the whole app down on first render.
+    private static func makeHighlightr() -> Highlightr? {
+        guard highlightrResourceBundleIsPresent() else {
+            NSLog("[CmdMD] Highlightr resource bundle not found next to the app — "
+                + "syntax highlighting disabled. Re-package with scripts/package_app.sh.")
+            return nil
+        }
+        return Highlightr()
+    }
+
+    /// Mirrors the locations SwiftPM's `Bundle.module` accessor searches for the
+    /// Highlightr resource bundle: the app's `Resources/` (packaged) and the
+    /// executable's own directory (`swift run`). If none contain it, instantiating
+    /// `Highlightr` would trap.
+    private static func highlightrResourceBundleIsPresent() -> Bool {
+        let bundleName = "Highlightr_Highlightr.bundle"
+        var roots: [URL] = []
+        if let resources = Bundle.main.resourceURL { roots.append(resources) }
+        roots.append(Bundle.main.bundleURL)
+        if let exeDir = Bundle.main.executableURL?.deletingLastPathComponent() {
+            roots.append(exeDir)
+        }
+        let fm = FileManager.default
+        return roots.contains { fm.fileExists(atPath: $0.appendingPathComponent(bundleName).path) }
+    }
 
     /// Documents past this size (UTF-16 units) skip token highlighting and get
     /// base attributes only, keeping typing latency flat on huge files.

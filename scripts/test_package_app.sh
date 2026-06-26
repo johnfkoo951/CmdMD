@@ -24,6 +24,11 @@ rm -rf "$DIST_DIR"
 [[ -f "$PLIST" ]] || fail "Info.plist was not created"
 [[ -f "$ZIP_FILE" ]] || fail "zip archive was not created"
 
+# Regression guard for the 1.4.6 crash: Highlightr's resource bundle must ship
+# inside the app or the first code-block highlight traps via Bundle.module.
+[[ -d "$APP_DIR/Contents/Resources/Highlightr_Highlightr.bundle" ]] \
+  || fail "Highlightr_Highlightr.bundle missing from Contents/Resources (syntax highlighting would crash on launch)"
+
 /usr/libexec/PlistBuddy -c "Print :CFBundleURLTypes:0:CFBundleURLSchemes:0" "$PLIST" \
   | grep -qx "cmdmd" \
   || fail "Info.plist does not register cmdmd URL scheme"

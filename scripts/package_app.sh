@@ -29,6 +29,22 @@ mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 cp "$BUILT_EXECUTABLE" "$EXECUTABLE"
 chmod 755 "$EXECUTABLE"
 
+# SwiftPM resource bundles (e.g. Highlightr_Highlightr.bundle — highlight.js +
+# CSS themes). Without these, Highlightr's `Bundle.module` accessor traps on the
+# first code-block highlight and the app crashes on launch (the 1.4.6
+# regression). Copy every generated *.bundle into Contents/Resources so
+# `Bundle.module` resolves them via `Bundle.main.resourceURL`.
+shopt -s nullglob
+resource_bundles=("$BUILD_BIN_DIR"/*.bundle)
+shopt -u nullglob
+if [[ ${#resource_bundles[@]} -eq 0 ]]; then
+  echo "Warning: no SwiftPM resource bundles found in $BUILD_BIN_DIR; code highlighting may be unavailable." >&2
+fi
+for bundle in "${resource_bundles[@]}"; do
+  echo "Bundling resource: $(basename "$bundle")"
+  cp -R "$bundle" "$RESOURCES_DIR/"
+done
+
 if [[ -f "$APP_ICON" ]]; then
   cp "$APP_ICON" "$RESOURCES_DIR/AppIcon.icns"
 else
@@ -87,7 +103,7 @@ cat > "$PLIST" <<'PLIST'
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>1.4.6</string>
+  <string>1.4.7</string>
   <key>CFBundleURLTypes</key>
   <array>
     <dict>
@@ -100,7 +116,7 @@ cat > "$PLIST" <<'PLIST'
     </dict>
   </array>
   <key>CFBundleVersion</key>
-  <string>12</string>
+  <string>13</string>
   <key>LSMinimumSystemVersion</key>
   <string>14.0</string>
   <key>NSPrincipalClass</key>
