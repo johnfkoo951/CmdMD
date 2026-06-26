@@ -9,6 +9,8 @@
 Open a note, read it beautifully, then send it to the right vault folder — one keystroke each.
 Native Swift / SwiftUI · macOS 14+ · CMDS‑branded, light & dark.
 
+**[cmdmd.cmdspace.work](https://cmdmd.cmdspace.work)** · [Download](https://github.com/johnfkoo951/CmdMD/releases/latest) · [Website source](https://github.com/johnfkoo951/CmdMD-web)
+
 <br/>
 
 <img src="docs/images/hero.png" width="900" alt="CmdMD in light and dark CMDS themes" />
