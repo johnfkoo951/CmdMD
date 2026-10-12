@@ -1,6 +1,23 @@
 import SwiftUI
 import WebKit
 
+extension PreviewTheme {
+    /// Approximate page background per theme, mirroring each CSS --bg-primary.
+    /// Painted behind the (transparent) preview WebView so reloads never flash
+    /// a mismatched color.
+    func backgroundColor(forDark isDark: Bool) -> Color {
+        switch self {
+        case .github:    return Color(hex: isDark ? "0d1117" : "ffffff")
+        case .obsidian:  return Color(hex: isDark ? "1e1e1e" : "ffffff")
+        case .minimal:   return Color(hex: isDark ? "1d1d1f" : "ffffff")
+        case .cmds:      return Color(hex: isDark ? "06080a" : "fbfbfa")
+        case .sepia:     return Color(hex: isDark ? "2b2114" : "f4ecd8")
+        case .newsprint: return Color(hex: isDark ? "121212" : "ffffff")
+        case .darkPro:   return Color(hex: "0d0d0d")
+        }
+    }
+}
+
 struct MarkdownPreviewView: NSViewRepresentable {
     /// Identity of the previewed document; a change means a tab switch, which
     /// renders immediately and resets scroll (vs. debounced live typing updates).
@@ -9,6 +26,10 @@ struct MarkdownPreviewView: NSViewRepresentable {
     let baseURL: URL?
     let options: MarkdownRenderOptions
     let scrollSyncEnabled: Bool
+    /// Unified zoom multiplier. Applied via `pageZoom` (reflowing, survives
+    /// loadHTMLString reloads) — deliberately NOT part of `options`, which
+    /// would force a full re-render per step and leak into HTML/PDF exports.
+    let zoom: Double
 
     func makeNSView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
@@ -18,6 +39,18 @@ struct MarkdownPreviewView: NSViewRepresentable {
 
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
+        webView.pageZoom = zoom
+        // Transparent web view: the SwiftUI pane behind it supplies the theme
+        // background, so the white default never flashes between loadHTMLString
+        // and first CSS paint (most visible as a dark-mode flicker while typing).
+        webView.setValue(false, forKey: "drawsBackground")
+        // Pinch-zoom routed to the app-wide zoom level (allowsMagnification
+        // would keep its own transform, out of sync with the editor).
+        let pinch = NSMagnificationGestureRecognizer(
+            target: context.coordinator,
+            action: #selector(Coordinator.handleMagnification(_:))
+        )
+        webView.addGestureRecognizer(pinch)
         context.coordinator.webView = webView
         context.coordinator.scrollSyncEnabled = scrollSyncEnabled
 
@@ -33,11 +66,20 @@ struct MarkdownPreviewView: NSViewRepresentable {
     func updateNSView(_ webView: WKWebView, context: Context) {
         context.coordinator.scrollSyncEnabled = scrollSyncEnabled
 
-        // Tab switch: render the new document at once (no debounce) and start at
-        // the top, rather than carrying the previous document's scroll offset.
+        // Before the early exits below — zoom must apply even when the
+        // document content is unchanged.
+        if webView.pageZoom != zoom {
+            webView.pageZoom = zoom
+        }
+
+        // Tab switch: remember the outgoing document's reading position, render
+        // the new one at once (no debounce), and restore its saved position —
+        // losing the scroll offset on every tab switch broke the core
+        // review-first flow of flipping between long notes.
         if context.coordinator.currentDocumentID != documentID {
-            context.coordinator.currentDocumentID = documentID
-            context.coordinator.renderImmediately(markdown: markdown, baseURL: baseURL, options: options)
+            context.coordinator.switchDocument(
+                to: documentID, markdown: markdown, baseURL: baseURL, options: options
+            )
             return
         }
 
@@ -67,6 +109,9 @@ struct MarkdownPreviewView: NSViewRepresentable {
         var currentDocumentID: UUID?
 
         private var pendingScrollY: Double = 0
+        /// Last known reading position per document, so tab switches restore
+        /// where the user left off instead of resetting to the top.
+        private var savedScrollPositions: [UUID: Double] = [:]
         private var renderDebounce: DispatchWorkItem?
         private var observers: [NSObjectProtocol] = []
 
@@ -102,20 +147,36 @@ struct MarkdownPreviewView: NSViewRepresentable {
             renderDebounce?.cancel()
         }
 
-        /// Debounces preview rebuilds and restores the prior scroll offset after
-        /// the reload, so typing in split view doesn't jump the preview to the top.
-        /// Immediate (non-debounced) render that resets scroll to the top — used
-        /// when the document changes (tab switch) so the new note renders at once.
-        func renderImmediately(markdown: String, baseURL: URL?, options: MarkdownRenderOptions) {
+        /// Tab switch: capture the outgoing document's scroll offset, then
+        /// immediately (no debounce) render the incoming one at its remembered
+        /// position (or the top on first visit).
+        func switchDocument(to documentID: UUID?, markdown: String, baseURL: URL?, options: MarkdownRenderOptions) {
+            let outgoingID = currentDocumentID
+            currentDocumentID = documentID
             renderDebounce?.cancel()
             guard let webView else { return }
-            let html = renderer.renderToHTML(markdown: markdown, baseURL: baseURL, options: options)
-            lastSource = markdown
-            lastOptions = options
-            pendingScrollY = 0
-            webView.loadHTMLString(html, baseURL: baseURL)
+
+            let render = { [weak self] in
+                guard let self, self.currentDocumentID == documentID, let webView = self.webView else { return }
+                let html = self.renderer.renderToHTML(markdown: markdown, baseURL: baseURL, options: options)
+                self.lastSource = markdown
+                self.lastOptions = options
+                self.pendingScrollY = documentID.flatMap { self.savedScrollPositions[$0] } ?? 0
+                self.load(html, into: webView, baseURL: baseURL)
+            }
+
+            if let outgoingID {
+                webView.evaluateJavaScript("window.scrollY") { [weak self] value, _ in
+                    if let y = value as? Double { self?.savedScrollPositions[outgoingID] = y }
+                    render()
+                }
+            } else {
+                render()
+            }
         }
 
+        /// Debounces preview rebuilds and restores the prior scroll offset, so
+        /// typing in split view doesn't jump the preview to the top.
         func scheduleRender(markdown: String, baseURL: URL?, options: MarkdownRenderOptions) {
             renderDebounce?.cancel()
             // Capture the document this render belongs to. A DispatchWorkItem that
@@ -132,11 +193,24 @@ struct MarkdownPreviewView: NSViewRepresentable {
                 webView.evaluateJavaScript("window.scrollY") { [weak self] value, _ in
                     guard let self, self.currentDocumentID == docID, let webView = self.webView else { return }
                     self.pendingScrollY = (value as? Double) ?? 0
-                    webView.loadHTMLString(html, baseURL: baseURL)
+                    self.load(html, into: webView, baseURL: baseURL)
                 }
             }
             renderDebounce = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
+        }
+
+        /// Loads HTML with the pending scroll offset injected so restoration
+        /// happens at DOMContentLoaded — before first paint. The didFinish
+        /// fallback stays for slow subresource layouts, but the top-of-page
+        /// flash per re-render is gone.
+        private func load(_ html: String, into webView: WKWebView, baseURL: URL?) {
+            var html = html
+            if pendingScrollY > 0 {
+                let restore = "<script>addEventListener('DOMContentLoaded',function(){window.scrollTo(0,\(pendingScrollY));});</script></head>"
+                html = html.replacingOccurrences(of: "</head>", with: restore)
+            }
+            webView.loadHTMLString(html, baseURL: baseURL)
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -162,6 +236,16 @@ struct MarkdownPreviewView: NSViewRepresentable {
         private func scrollToFraction(_ fraction: Double) {
             let js = "window.scrollTo(0, \(fraction) * (document.documentElement.scrollHeight - window.innerHeight));"
             webView?.evaluateJavaScript(js, completionHandler: nil)
+        }
+
+        // MARK: Pinch zoom
+
+        @objc func handleMagnification(_ recognizer: NSMagnificationGestureRecognizer) {
+            // `magnification` accumulates over the gesture; resetting it after
+            // each read turns the callback into incremental deltas.
+            let delta = recognizer.magnification
+            recognizer.magnification = 0
+            AppState.shared?.adjustZoom(by: delta)
         }
 
         // MARK: Preview → app messages

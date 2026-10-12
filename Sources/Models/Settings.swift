@@ -73,6 +73,14 @@ struct AppSettings: Codable, Equatable {
     var insertSpacesInsteadOfTabs: Bool = true
     var highlightCurrentLine: Bool = true
     var enableAutocompletion: Bool = true
+    /// Copy a mouse-drag selection to the clipboard the moment the drag ends,
+    /// so rapid successive selections each land in clipboard-history managers.
+    var copySelectionOnDrag: Bool = true
+
+    // Zoom — a multiplier applied on top of fontSize (editor) and pageZoom
+    // (preview). Deliberately separate from the font-size settings so the
+    // Settings sliders keep their 10–24 ranges and exports stay unscaled.
+    var zoomLevel: Double = 1.0
 
     // Preview
     var previewTheme: String = "CMDS"
@@ -99,6 +107,9 @@ struct AppSettings: Codable, Equatable {
     var restoreLastSession: Bool = true
     var confirmBeforeClosingDirtyTabs: Bool = true
     var scrollSyncEnabled: Bool = true
+
+    // Diagnostics — mirror of Log's file sink (logs/ under Application Support).
+    var fileLoggingEnabled: Bool = true
 
     // Onboarding — false until the first-run setup (appearance choice) is done.
     var hasCompletedOnboarding: Bool = false
@@ -129,6 +140,9 @@ struct AppSettings: Codable, Equatable {
         insertSpacesInsteadOfTabs = try c.decodeIfPresent(Bool.self, forKey: .insertSpacesInsteadOfTabs) ?? d.insertSpacesInsteadOfTabs
         highlightCurrentLine = try c.decodeIfPresent(Bool.self, forKey: .highlightCurrentLine) ?? d.highlightCurrentLine
         enableAutocompletion = try c.decodeIfPresent(Bool.self, forKey: .enableAutocompletion) ?? d.enableAutocompletion
+        copySelectionOnDrag = try c.decodeIfPresent(Bool.self, forKey: .copySelectionOnDrag) ?? d.copySelectionOnDrag
+        zoomLevel = try c.decodeIfPresent(Double.self, forKey: .zoomLevel) ?? d.zoomLevel
+        fileLoggingEnabled = try c.decodeIfPresent(Bool.self, forKey: .fileLoggingEnabled) ?? d.fileLoggingEnabled
         previewTheme = try c.decodeIfPresent(String.self, forKey: .previewTheme) ?? d.previewTheme
         previewSettings = try c.decodeIfPresent(PreviewSettings.self, forKey: .previewSettings) ?? d.previewSettings
         enableWikiLinks = try c.decodeIfPresent(Bool.self, forKey: .enableWikiLinks) ?? d.enableWikiLinks

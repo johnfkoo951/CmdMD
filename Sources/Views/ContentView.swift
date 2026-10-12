@@ -21,11 +21,12 @@ struct ContentView: View {
             set: { appState.sidebarVisible = $0 != .detailOnly }
         )) {
             SidebarView()
-                .navigationSplitViewColumnWidth(min: 200, ideal: 250, max: 300)
+                .navigationSplitViewColumnWidth(min: 200, ideal: 250, max: 360)
         } detail: {
             MainEditorView()
         }
         .navigationTitle(appState.windowTitle)
+        .modifier(DocumentProxyIcon(url: appState.currentDocument?.fileURL))
         .inspector(isPresented: $state.inspectorVisible) {
             InspectorView()
                 .inspectorColumnWidth(min: 250, ideal: 280, max: 350)
@@ -39,6 +40,10 @@ struct ContentView: View {
         .onChange(of: appState.settings.defaultWindowHeight) { _, h in
             hostWindow?.setContentSize(NSSize(width: appState.settings.defaultWindowWidth, height: h))
         }
+        .onChange(of: appState.activeTab?.isDirty == true) { _, dirty in
+            // Native "edited" dot inside the window close button.
+            hostWindow?.isDocumentEdited = dirty
+        }
         .toolbar {
             ToolbarItemGroup(placement: .navigation) {
                 ViewModePicker()
@@ -49,11 +54,13 @@ struct ContentView: View {
 
                 // The right-sidebar (inspector) toggle, pinned to the trailing edge.
                 Button {
-                    appState.inspectorVisible.toggle()
+                    appState.toggleInspector()
                 } label: {
-                    Image(systemName: "sidebar.right")
+                    // A real Label (not a bare Image) keeps the toolbar overflow
+                    // menu and VoiceOver meaningful.
+                    Label("Inspector", systemImage: "sidebar.right")
                 }
-                .help("Toggle Inspector (\(appState.keyBinding(for: .toggleInspector).displayString))")
+                .help("Show or hide the Inspector (\(appState.keyBinding(for: .toggleInspector).displayString))")
             }
         }
         .sheet(isPresented: $state.showSendToVault, onDismiss: {
@@ -63,12 +70,6 @@ struct ContentView: View {
         }
         .sheet(isPresented: $state.showVaultManager) {
             VaultManagerView()
-        }
-        .sheet(isPresented: $state.showCommandPalette) {
-            CommandPaletteView()
-        }
-        .sheet(isPresented: $state.showOmnisearch) {
-            OmnisearchView()
         }
         .sheet(isPresented: $state.showQuickCapture) {
             // The ⇧⌘M quick-capture panel — previously the hotkey set a flag
@@ -99,13 +100,75 @@ struct ContentView: View {
             Text(appState.errorMessage ?? "")
         }
         .overlay {
+            // ⌘P / ⇧⌘O as centered floating panels (Spotlight / Xcode Open
+            // Quickly idiom) — the previous window sheets slid down from the
+            // title bar with double chrome and felt slow to invoke.
+            PaletteOverlay()
+        }
+        .overlay {
             if let toast = appState.toastMessage {
                 ToastView(message: toast)
                     .transition(.move(edge: .top).combined(with: .opacity))
+                    .allowsHitTesting(false)
             }
         }
         .animation(.easeInOut(duration: 0.2), value: appState.toastMessage)
         .focusedSceneValue(\.document, appState.currentDocument)
+    }
+}
+
+/// Applies `.navigationDocument` only when a real file backs the current tab —
+/// this is what puts the draggable proxy icon (with ⌘-click path menu) in the
+/// titlebar, like every first-party document app.
+struct DocumentProxyIcon: ViewModifier {
+    let url: URL?
+
+    func body(content: Content) -> some View {
+        if let url {
+            content.navigationDocument(url)
+        } else {
+            content
+        }
+    }
+}
+
+/// Hosts the command palette and Omnisearch as top-anchored floating overlays
+/// with a click-away scrim, replacing their `.sheet` presentation.
+struct PaletteOverlay: View {
+    @Environment(AppState.self) private var appState
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var isPresented: Bool {
+        appState.showCommandPalette || appState.showOmnisearch
+    }
+
+    var body: some View {
+        @Bindable var state = appState
+
+        ZStack(alignment: .top) {
+            if isPresented {
+                // Barely-visible scrim: dims just enough to signal modality and
+                // catches click-away dismissal.
+                Color.black.opacity(0.12)
+                    .ignoresSafeArea()
+                    .onTapGesture {
+                        state.showCommandPalette = false
+                        state.showOmnisearch = false
+                    }
+                    .transition(.opacity)
+
+                Group {
+                    if appState.showCommandPalette {
+                        CommandPaletteView()
+                    } else {
+                        OmnisearchView()
+                    }
+                }
+                .padding(.top, 110)
+                .transition(.scale(scale: 0.97, anchor: .top).combined(with: .opacity))
+            }
+        }
+        .animation(reduceMotion ? nil : .snappy(duration: 0.18), value: isPresented)
     }
 }
 

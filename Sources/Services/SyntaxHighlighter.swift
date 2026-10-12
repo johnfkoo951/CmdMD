@@ -124,8 +124,10 @@ class SyntaxHighlighter {
             let contentRange = match.range(at: 2)
             let level = hashRange.length
 
+            // Design sizes at the 14 pt default body font, scaled with the
+            // actual font so zoom (and larger body sizes) enlarge headings too.
             let headingSizes: [Int: CGFloat] = [1: 28, 2: 24, 3: 20, 4: 18, 5: 16, 6: 14]
-            let fontSize = headingSizes[level] ?? font.pointSize
+            let fontSize = (headingSizes[level] ?? 14) * font.pointSize / 14
             let headingFont = NSFont.systemFont(ofSize: fontSize, weight: .bold)
 
             string.addAttributes([
@@ -144,10 +146,12 @@ class SyntaxHighlighter {
         let text = string.string
         let range = NSRange(location: 0, length: string.length)
 
+        // Bold variant of the *editor* font — swapping to proportional SF Pro
+        // here made **bold** spans reflow against the surrounding monospace.
+        let boldFont = NSFontManager.shared.convert(font, toHaveTrait: .boldFontMask)
+
         boldPattern.enumerateMatches(in: text, range: range) { match, _, _ in
             guard let match = match else { return }
-
-            let boldFont = NSFont.systemFont(ofSize: font.pointSize, weight: .bold)
             string.addAttribute(.font, value: boldFont, range: match.range)
         }
     }

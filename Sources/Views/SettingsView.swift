@@ -108,6 +108,19 @@ struct GeneralSettingsView: View {
             }
 
             Section {
+                Toggle("Write log files", isOn: $state.settings.fileLoggingEnabled)
+
+                Button("Open Logs Folder") {
+                    NSWorkspace.shared.activateFileViewerSelecting([Log.logsDirectory])
+                }
+            } header: {
+                Text("Diagnostics")
+            } footer: {
+                Text("Key actions (open, save, send, zoom, errors) are logged to Console.app and daily files kept for \(Log.retentionDays) days.")
+                    .font(.caption)
+            }
+
+            Section {
                 LabeledContent("Version", value: AppInfo.versionLabel)
                 LabeledContent("Made by", value: AppInfo.maker)
                 Link(destination: AppInfo.website) {
@@ -126,7 +139,9 @@ struct GeneralSettingsView: View {
         }
         .formStyle(.grouped)
         .onChange(of: appState.settings) { _, _ in
-            appState.saveUserData()
+            // Debounced: slider drags fire per tick, and each save rewrites
+            // all the data JSONs synchronously on the main thread.
+            appState.saveUserDataDebounced()
         }
     }
 }
@@ -145,7 +160,7 @@ struct EditorSettingsView: View {
                             Circle()
                                 .fill(theme.backgroundColor)
                                 .frame(width: 12, height: 12)
-                                .overlay(Circle().stroke(Color.gray.opacity(0.3), lineWidth: 1))
+                                .overlay(Circle().stroke(Color(nsColor: .separatorColor), lineWidth: 1))
                             Text(theme.rawValue)
                         }
                         .tag(theme)
@@ -178,6 +193,10 @@ struct EditorSettingsView: View {
                         .frame(width: 50)
                 }
 
+                Text("⌘= / ⌘− zoom the editor and preview together on top of this size; ⌘0 resets. Pinch also works.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
                 Stepper("Tab size: \(appState.settings.tabSize)", value: $state.settings.tabSize, in: 2...8)
                 Toggle("Insert spaces when pressing Tab", isOn: $state.settings.insertSpacesInsteadOfTabs)
             }
@@ -186,6 +205,12 @@ struct EditorSettingsView: View {
                 Toggle("Wiki-link and tag autocompletion", isOn: $state.settings.enableAutocompletion)
 
                 Text("Type [[ to complete note names from your open folder and vaults, # to complete known tags.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Toggle("Copy selection to clipboard on mouse drag", isOn: $state.settings.copySelectionOnDrag)
+
+                Text("The instant a mouse selection ends it is copied — rapid selections each land in your clipboard history.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -197,7 +222,9 @@ struct EditorSettingsView: View {
         }
         .formStyle(.grouped)
         .onChange(of: appState.settings) { _, _ in
-            appState.saveUserData()
+            // Debounced: slider drags fire per tick, and each save rewrites
+            // all the data JSONs synchronously on the main thread.
+            appState.saveUserDataDebounced()
         }
     }
 }
@@ -344,7 +371,7 @@ struct PreviewSettingsView: View {
                     .frame(height: 100)
                     .overlay(
                         RoundedRectangle(cornerRadius: 4)
-                            .stroke(Color.gray.opacity(0.3), lineWidth: 1)
+                            .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
                     )
 
                 Text("Injected after the theme styles — overrides anything above.")
@@ -354,7 +381,9 @@ struct PreviewSettingsView: View {
         }
         .formStyle(.grouped)
         .onChange(of: appState.settings) { _, _ in
-            appState.saveUserData()
+            // Debounced: slider drags fire per tick, and each save rewrites
+            // all the data JSONs synchronously on the main thread.
+            appState.saveUserDataDebounced()
         }
     }
 }
@@ -363,6 +392,7 @@ struct VaultSettingsView: View {
     @Environment(AppState.self) private var appState
     @State private var showAddVault = false
     @State private var defaultVaultFolders: [String] = []
+    @State private var vaultPendingRemoval: Vault?
 
     var body: some View {
         @Bindable var state = appState
@@ -397,11 +427,12 @@ struct VaultSettingsView: View {
                         Spacer()
 
                         Button(role: .destructive) {
-                            appState.removeVault(vault)
+                            vaultPendingRemoval = vault
                         } label: {
                             Image(systemName: "trash")
                         }
                         .buttonStyle(.borderless)
+                        .help("Disconnect this vault")
                     }
                     .padding(.vertical, 4)
                 }
@@ -476,9 +507,27 @@ struct VaultSettingsView: View {
         .sheet(isPresented: $showAddVault) {
             AddVaultSheet()
         }
+        .confirmationDialog(
+            "Disconnect \u{201C}\(vaultPendingRemoval?.displayName ?? "")\u{201D}?",
+            isPresented: Binding(
+                get: { vaultPendingRemoval != nil },
+                set: { if !$0 { vaultPendingRemoval = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Disconnect", role: .destructive) {
+                if let vault = vaultPendingRemoval { appState.removeVault(vault) }
+                vaultPendingRemoval = nil
+            }
+            Button("Cancel", role: .cancel) { vaultPendingRemoval = nil }
+        } message: {
+            Text("Routing rules targeting this vault are removed too. Files in the vault are not touched.")
+        }
         .onAppear { loadDefaultVaultFolders() }
         .onChange(of: appState.settings) { _, _ in
-            appState.saveUserData()
+            // Debounced: slider drags fire per tick, and each save rewrites
+            // all the data JSONs synchronously on the main thread.
+            appState.saveUserDataDebounced()
         }
     }
 

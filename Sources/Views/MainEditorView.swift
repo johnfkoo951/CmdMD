@@ -67,7 +67,7 @@ struct SimpleBreadcrumbView: View {
             .padding(.vertical, 4)
         }
         .frame(height: 24)
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
+        .background(.bar)
         .overlay(alignment: .bottom) {
             Divider()
         }
@@ -115,6 +115,7 @@ struct SimpleBreadcrumbView: View {
 /// offscreen instead of resized), so even text reflow is avoided.
 struct DocumentEditorView: View {
     @Environment(AppState.self) private var appState
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let document: MarkdownDocument
 
     private static let minPaneWidth: CGFloat = 280
@@ -122,6 +123,10 @@ struct DocumentEditorView: View {
     var body: some View {
         @Bindable var state = appState
         let mode = appState.viewMode
+        // Opacity-only crossfade on mode switch: a pure layer fade, so neither
+        // the NSTextView nor the WKWebView ever relayouts mid-animation.
+        // Frames/offsets stay unanimated. Honors Reduce Motion.
+        let fade: Animation? = reduceMotion ? nil : .easeOut(duration: 0.15)
 
         GeometryReader { geometry in
             let total = max(1, geometry.size.width)
@@ -135,13 +140,13 @@ struct DocumentEditorView: View {
                 EditorPane()
                     .frame(width: editorWidth, height: height)
                     .offset(x: mode == .preview ? -total : 0)
-                    .opacity(mode == .preview ? 0 : 1)
+                    .animation(fade) { $0.opacity(mode == .preview ? 0 : 1) }
                     .allowsHitTesting(mode != .preview)
 
                 PreviewPane()
                     .frame(width: previewWidth, height: height)
                     .offset(x: mode == .source ? total : (mode == .split ? editorWidth : 0))
-                    .opacity(mode == .source ? 0 : 1)
+                    .animation(fade) { $0.opacity(mode == .source ? 0 : 1) }
                     .allowsHitTesting(mode != .source)
 
                 if mode == .split {
@@ -246,9 +251,11 @@ struct EditorPane: View {
     @State private var isDropTargeted = false
 
     /// Resolves the editor font from settings.fontName, falling back to the
-    /// system monospaced font if the named font isn't installed.
+    /// system monospaced font if the named font isn't installed. The zoom
+    /// multiplier applies here so the zoomed font flows through the whole
+    /// pipeline (updateNSView → highlighter) via the one `font` parameter.
     private func editorFont() -> NSFont {
-        let size = appState.settings.fontSize
+        let size = appState.settings.fontSize * appState.settings.zoomLevel
         let name = appState.settings.fontName
         if !name.isEmpty, let custom = NSFont(name: name, size: size) {
             return custom
@@ -276,11 +283,15 @@ struct EditorPane: View {
             insertSpacesForTab: settings.insertSpacesInsteadOfTabs,
             enableCompletion: settings.enableAutocompletion,
             scrollSyncEnabled: settings.scrollSyncEnabled && appState.viewMode == .split,
+            copySelectionOnDrag: settings.copySelectionOnDrag,
             onImageDrop: { imageURL in
                 handleImageDrop(imageURL)
             },
             onSelectionChange: { line, column in
                 appState.updateCursorPosition(line: line, column: column)
+            },
+            onMagnify: { magnification in
+                appState.adjustZoom(by: magnification)
             },
             completionsProvider: { context in
                 CompletionService.completions(
@@ -362,15 +373,22 @@ struct EditorPane: View {
 
 struct PreviewPane: View {
     @Environment(AppState.self) private var appState
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
+        let theme = PreviewTheme(rawValue: appState.settings.previewTheme) ?? .github
+
         MarkdownPreviewView(
             documentID: appState.currentDocument?.id,
             markdown: appState.currentDocument?.content ?? "",
             baseURL: appState.currentDocument?.fileURL?.deletingLastPathComponent(),
             options: appState.renderOptions(),
-            scrollSyncEnabled: appState.settings.scrollSyncEnabled && appState.viewMode == .split
+            scrollSyncEnabled: appState.settings.scrollSyncEnabled && appState.viewMode == .split,
+            zoom: appState.settings.zoomLevel
         )
+        // The WebView is transparent; this pane paints the theme background so
+        // per-render reloads never flash white in dark mode.
+        .background(theme.backgroundColor(forDark: colorScheme == .dark))
     }
 }
 
@@ -519,6 +537,7 @@ struct WelcomeButton: View {
             )
         }
         .buttonStyle(.plain)
+        .animation(.easeOut(duration: 0.12), value: isHovering)
         .onHover { isHovering = $0 }
     }
 }

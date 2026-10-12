@@ -29,10 +29,6 @@ struct SendToVaultSheet: View {
                 Text(isBatch ? "Send \(appState.batchSendURLs.count) Files to Vault" : "Send to Vault")
                     .font(.headline)
                 Spacer()
-                Button("Cancel") {
-                    dismiss()
-                }
-                .buttonStyle(.borderless)
             }
             .padding()
             .background(.bar)
@@ -137,8 +133,23 @@ struct SendToVaultSheet: View {
             }
             .formStyle(.grouped)
 
-            HStack {
+            // HIG dialog footer: Cancel sits immediately left of the default
+            // action at the trailing edge; ⎋ cancels, ↩ sends.
+            HStack(spacing: 12) {
+                if isSending {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text(isBatch ? "Sending files…" : "Sending…")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+
                 Spacer()
+
+                Button("Cancel") {
+                    dismiss()
+                }
+                .keyboardShortcut(.cancelAction)
 
                 Button(isBatch ? "Send All" : "Send") {
                     send()

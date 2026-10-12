@@ -12,14 +12,23 @@ struct CompletionPopupView: View {
                     item: item,
                     isSelected: index == selectedIndex
                 )
+                .contentShape(Rectangle())
+                .onHover { hovering in
+                    if hovering { selectedIndex = index }
+                }
                 .onTapGesture {
                     onSelect(item)
                 }
             }
         }
+        .padding(.vertical, 4)
         .frame(width: 300)
         .background(.regularMaterial)
         .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
+        )
         .shadow(color: .black.opacity(0.15), radius: 8, y: 4)
     }
 }
@@ -50,9 +59,11 @@ struct CompletionRowView: View {
             
             Spacer()
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
         .background(isSelected ? Color.cmdsAccent : Color.clear)
+        .clipShape(RoundedRectangle(cornerRadius: 5))
+        .padding(.horizontal, 4)
     }
 
     private func iconForType(_ type: CompletionContext.Kind) -> String {
@@ -77,16 +88,21 @@ class CompletionWindowController: NSObject {
     private var selectedIndex: Int = 0
     private var onSelect: ((CompletionItem) -> Void)?
     
-    func show(items: [CompletionItem], at point: NSPoint, in parentWindow: NSWindow?, onSelect: @escaping (CompletionItem) -> Void) {
-        guard !items.isEmpty else {
+    /// The popup has no internal scrolling, so more rows than this would clip
+    /// (and ↓ could select an invisible item). Ranked items degrade gracefully.
+    private static let maxVisibleItems = 8
+
+    func show(items allItems: [CompletionItem], at point: NSPoint, in parentWindow: NSWindow?, onSelect: @escaping (CompletionItem) -> Void) {
+        guard !allItems.isEmpty else {
             dismiss()
             return
         }
-        
+
+        let items = Array(allItems.prefix(Self.maxVisibleItems))
         self.items = items
         self.selectedIndex = 0
         self.onSelect = onSelect
-        
+
         let popupView = CompletionPopupView(
             items: items,
             selectedIndex: Binding(get: { [weak self] in self?.selectedIndex ?? 0 },
@@ -95,11 +111,10 @@ class CompletionWindowController: NSObject {
                 self?.selectItem(item)
             }
         )
-        
+
         if window == nil {
-            let contentRect = NSRect(x: 0, y: 0, width: 300, height: min(CGFloat(items.count) * 44, 300))
             window = NSWindow(
-                contentRect: contentRect,
+                contentRect: NSRect(x: 0, y: 0, width: 300, height: 100),
                 styleMask: [.borderless],
                 backing: .buffered,
                 defer: false
@@ -109,18 +124,20 @@ class CompletionWindowController: NSObject {
             window?.level = .floating
             window?.hasShadow = true
         }
-        
+
         hostingView = NSHostingView(rootView: popupView)
         window?.contentView = hostingView
-        
-        let height = min(CGFloat(items.count) * 44, 300)
+
+        // Measure the actual content height instead of assuming a row height —
+        // rows with a detail line are taller than bare ones.
+        let height = hostingView?.fittingSize.height ?? CGFloat(items.count) * 44
         let origin = NSPoint(x: point.x, y: point.y - height)
         window?.setFrame(NSRect(origin: origin, size: NSSize(width: 300, height: height)), display: true)
-        
+
         if let parentWindow = parentWindow {
             parentWindow.addChildWindow(window!, ordered: .above)
         }
-        
+
         window?.orderFront(nil)
     }
     
@@ -130,6 +147,13 @@ class CompletionWindowController: NSObject {
         window.orderOut(nil)
         items = []
         selectedIndex = 0
+    }
+
+    /// Repositions the popup (top-left anchor) — used to track the caret while
+    /// the editor scrolls underneath.
+    func move(to point: NSPoint) {
+        guard let window, window.isVisible else { return }
+        window.setFrameOrigin(NSPoint(x: point.x, y: point.y - window.frame.height))
     }
     
     func moveSelectionUp() {

@@ -3,6 +3,7 @@ import SwiftUI
 /// Menu-bar extra content: quick capture plus shortcuts into the main app.
 struct MenuBarView: View {
     @Environment(AppState.self) private var appState
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         VStack(spacing: 0) {
@@ -12,8 +13,8 @@ struct MenuBarView: View {
 
             HStack {
                 Button {
+                    openWindow(id: AppWindowPolicy.mainSceneID)
                     NSApp.activate(ignoringOtherApps: true)
-                    NSApp.windows.first(where: { $0.canBecomeMain })?.makeKeyAndOrderFront(nil)
                 } label: {
                     Label("Open CmdMD", systemImage: "macwindow")
                         .font(.caption)

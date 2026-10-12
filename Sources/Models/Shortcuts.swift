@@ -85,6 +85,9 @@ enum AppShortcut: String, CaseIterable, Identifiable {
     case findInDocument
     case reloadFromDisk
     case openFolder
+    case zoomIn
+    case zoomOut
+    case resetZoom
 
     var id: String { rawValue }
 
@@ -107,6 +110,9 @@ enum AppShortcut: String, CaseIterable, Identifiable {
         case .findInDocument: return "Find in Document"
         case .reloadFromDisk: return "Reload from Disk"
         case .openFolder:     return "Open Folder…"
+        case .zoomIn:         return "Zoom In"
+        case .zoomOut:        return "Zoom Out"
+        case .resetZoom:      return "Actual Size"
         }
     }
 
@@ -129,6 +135,10 @@ enum AppShortcut: String, CaseIterable, Identifiable {
         case .findInDocument:  return KeyBinding(key: "f", command: true)
         case .reloadFromDisk:  return KeyBinding(key: "r", command: true, option: true)
         case .openFolder:      return KeyBinding(key: "o", command: true, option: true)
+        // "=" is the physical ⌘+ key (unshifted); matches Safari/Xcode zoom.
+        case .zoomIn:          return KeyBinding(key: "=", command: true)
+        case .zoomOut:         return KeyBinding(key: "-", command: true)
+        case .resetZoom:       return KeyBinding(key: "0", command: true)
         }
     }
 }

@@ -11,12 +11,19 @@ import SwiftUI
 
 struct CommandPaletteView: View {
     @Environment(AppState.self) private var appState
-    @Environment(\.dismiss) private var dismiss
 
     @State private var model = CommandPaletteModel()
+    /// Built once per palette invocation — rebuilding (with fresh UUIDs) on
+    /// every keystroke churned ForEach identity and re-allocated all commands.
+    @State private var allCommands: [Command] = []
+
+    /// Presented as an overlay, not a sheet, so the environment dismiss action
+    /// is inert — closing means clearing the presentation flag.
+    private func dismiss() {
+        appState.showCommandPalette = false
+    }
 
     var filteredCommands: [Command] {
-        let allCommands = Command.allCommands(appState: appState)
         guard !model.query.isEmpty else { return allCommands }
 
         return allCommands
@@ -94,9 +101,9 @@ struct CommandPaletteView: View {
                 }
                 .onChange(of: model.selectedIndex) { _, newIndex in
                     guard model.navigatingByKeyboard else { return }
-                    withAnimation {
-                        proxy.scrollTo(newIndex, anchor: .center)
-                    }
+                    // Unanimated: arrow-key repeat with an animated scroll
+                    // lagged behind the selection (native lists snap).
+                    proxy.scrollTo(newIndex, anchor: nil)
                 }
             }
         }
@@ -104,7 +111,14 @@ struct CommandPaletteView: View {
         .tint(.cmdsAccent)
         .background(.regularMaterial)
         .clipShape(RoundedRectangle(cornerRadius: 12))
-        .shadow(color: .black.opacity(0.2), radius: 20, y: 10)
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.25), radius: 24, y: 12)
+        .onAppear {
+            allCommands = Command.allCommands(appState: appState)
+        }
         .onChange(of: model.query) { _, _ in
             model.selectedIndex = 0
         }
@@ -352,20 +366,50 @@ struct Command: Identifiable {
                 title: "Toggle Sidebar",
                 subtitle: "Show or hide the sidebar",
                 icon: "sidebar.left",
-                shortcut: "⌃⌘B",
+                shortcut: appState.keyBinding(for: .toggleSidebar).displayString,
                 keywords: ["sidebar", "toggle", "hide", "show"]
             ) {
-                appState.sidebarVisible.toggle()
+                appState.toggleSidebar()
             },
 
             Command(
                 title: "Toggle Inspector",
                 subtitle: "Show or hide the inspector panel",
                 icon: "sidebar.right",
-                shortcut: "⌥⌘I",
+                shortcut: appState.keyBinding(for: .toggleInspector).displayString,
                 keywords: ["inspector", "toggle", "info", "details", "toc", "properties"]
             ) {
-                appState.inspectorVisible.toggle()
+                appState.toggleInspector()
+            },
+
+            Command(
+                title: "Zoom In",
+                subtitle: "Enlarge editor and preview together",
+                icon: "plus.magnifyingglass",
+                shortcut: appState.keyBinding(for: .zoomIn).displayString,
+                keywords: ["zoom", "in", "bigger", "enlarge", "magnify"]
+            ) {
+                appState.zoomIn()
+            },
+
+            Command(
+                title: "Zoom Out",
+                subtitle: "Shrink editor and preview together",
+                icon: "minus.magnifyingglass",
+                shortcut: appState.keyBinding(for: .zoomOut).displayString,
+                keywords: ["zoom", "out", "smaller", "shrink"]
+            ) {
+                appState.zoomOut()
+            },
+
+            Command(
+                title: "Actual Size",
+                subtitle: "Reset zoom to 100%",
+                icon: "1.magnifyingglass",
+                shortcut: appState.keyBinding(for: .resetZoom).displayString,
+                keywords: ["zoom", "reset", "actual", "size", "100"]
+            ) {
+                appState.resetZoom()
             },
 
             Command(

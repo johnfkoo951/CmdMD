@@ -119,7 +119,10 @@ struct RibbonIcon: View {
 struct FileTreeView: View {
     @Environment(AppState.self) private var appState
     @Binding var showSearch: Bool
-    
+    /// Native source-list selection: accent-tinted highlight for the current
+    /// file plus ↑/↓ keyboard navigation. Kept in sync with the active tab.
+    @State private var selection: URL?
+
     var body: some View {
         Group {
             if appState.currentFolder == nil {
@@ -164,12 +167,24 @@ struct FileTreeView: View {
                         .help("Refresh")
                     }
 
-                    List {
+                    List(selection: $selection) {
                         ForEach(appState.fileTree) { item in
                             FileTreeItemRow(item: item)
                         }
                     }
                     .listStyle(.sidebar)
+                    .onChange(of: selection) { _, url in
+                        guard let url else { return }
+                        // Browsing semantics: selecting replaces the current
+                        // tab's document (pinned/dirty tabs get a new tab).
+                        appState.openDocument(at: url, inNewTab: false)
+                    }
+                    .onChange(of: appState.activeTab?.fileURL) { _, url in
+                        if selection != url { selection = url }
+                    }
+                    .onAppear {
+                        selection = appState.activeTab?.fileURL
+                    }
                 }
             }
         }
@@ -369,9 +384,10 @@ struct FileTreeItemRow: View {
                         .foregroundColor(.yellow)
                 }
             }
-            .onTapGesture {
-                appState.openDocument(at: item.url, inNewTab: true)
-            }
+            // Tagged for List selection — activation happens through the
+            // selection binding (native highlight + arrow-key navigation),
+            // not a tap gesture.
+            .tag(item.url)
             .contextMenu {
                 FileTreeContextMenu(item: item)
             }
@@ -428,24 +444,48 @@ struct FileTreeContextMenu: View {
                 Label("Add to Favorites", systemImage: "star")
             }
         }
-        
+
         Divider()
-        
+
+        Button {
+            appState.renameItem(at: item.url)
+        } label: {
+            Label("Rename…", systemImage: "pencil")
+        }
+
+        if !item.isDirectory {
+            Button {
+                appState.duplicateFile(at: item.url)
+            } label: {
+                Label("Duplicate", systemImage: "plus.square.on.square")
+            }
+        }
+
+        Divider()
+
         Button {
             revealInFinder(item.url)
         } label: {
             Label("Reveal in Finder", systemImage: "folder")
         }
-        
+
+        Button {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(item.url.path, forType: .string)
+            appState.showToast("Path copied")
+        } label: {
+            Label("Copy Path", systemImage: "doc.on.doc")
+        }
+
         Divider()
-        
+
         Button(role: .destructive) {
-            moveToTrash(item.url)
+            appState.moveItemToTrash(at: item.url)
         } label: {
             Label("Move to Trash", systemImage: "trash")
         }
     }
-    
+
     private func createNewFile(in folder: URL) {
         appState.createNewFile(in: folder)
     }
@@ -456,11 +496,6 @@ struct FileTreeContextMenu: View {
 
     private func revealInFinder(_ url: URL) {
         NSWorkspace.shared.selectFile(url.path, inFileViewerRootedAtPath: url.deletingLastPathComponent().path)
-    }
-    
-    private func moveToTrash(_ url: URL) {
-        try? FileManager.default.trashItem(at: url, resultingItemURL: nil)
-        appState.loadFileTree()
     }
 
     /// All Markdown files directly in `folder` and its subfolders (for batch send).
@@ -523,24 +558,27 @@ struct FavoritesListView: View {
 
 struct FavoriteRow: View {
     let favorite: FavoriteItem
-    
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 6) {
                 Image(systemName: "star.fill")
                     .font(.caption)
                     .foregroundColor(.yellow)
+                // Sidebar rows use the standard 13pt weight — .headline made
+                // every row shout.
                 Text(favorite.displayName)
-                    .font(.headline)
+                    .font(.system(size: 13))
                     .lineLimit(1)
             }
-            
-            Text(favorite.url.deletingLastPathComponent().path)
+
+            Text((favorite.url.deletingLastPathComponent().path as NSString).abbreviatingWithTildeInPath)
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
+                .truncationMode(.middle)
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, 2)
     }
 }
 
@@ -615,10 +653,10 @@ struct DraftRow: View {
     let draft: Draft
     
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 3) {
             HStack {
                 Text(draft.displayTitle)
-                    .font(.headline)
+                    .font(.system(size: 13, weight: .medium))
                     .lineLimit(1)
                 
                 Spacer()
@@ -686,19 +724,20 @@ struct RecentFilesView: View {
 
 struct RecentFileRow: View {
     let url: URL
-    
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 2) {
             Text(url.deletingPathExtension().lastPathComponent)
-                .font(.headline)
+                .font(.system(size: 13))
                 .lineLimit(1)
-            
-            Text(url.deletingLastPathComponent().path)
+
+            Text((url.deletingLastPathComponent().path as NSString).abbreviatingWithTildeInPath)
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
+                .truncationMode(.middle)
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, 2)
     }
 }
 

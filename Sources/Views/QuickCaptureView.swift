@@ -67,18 +67,19 @@ struct QuickCaptureView: View {
 
                 Spacer()
 
+                // HIG order: Cancel (⎋) beside the prominent default action.
+                // ⌘↩ saves — a bare Return must keep inserting newlines.
+                Button("Cancel") {
+                    onDone?()
+                }
+                .keyboardShortcut(.cancelAction)
+
                 Button("Save as Draft") {
                     saveDraft()
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(.borderedProminent)
                 .disabled(noteText.isEmpty)
                 .keyboardShortcut(.return, modifiers: .command)
-
-                Button("Discard") {
-                    noteText = ""
-                    onDone?()
-                }
-                .buttonStyle(.borderless)
             }
             .padding(12)
         }

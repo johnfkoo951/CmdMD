@@ -2,7 +2,7 @@ import SwiftUI
 
 struct StatusBarView: View {
     @Environment(AppState.self) private var appState
-    
+
     var body: some View {
         HStack(spacing: 16) {
             if let document = appState.currentDocument {
@@ -13,17 +13,7 @@ struct StatusBarView: View {
                         .frame(height: 12)
                 }
 
-                WordCountView(document: document)
-
-                Divider()
-                    .frame(height: 12)
-
-                CharacterCountView(document: document)
-
-                Divider()
-                    .frame(height: 12)
-
-                ReadingTimeView(document: document)
+                DocumentStatsView(document: document)
             }
 
             Spacer()
@@ -35,25 +25,105 @@ struct StatusBarView: View {
                     .frame(height: 12)
             }
 
-            if appState.isDirty {
+            // Stored flag — recomputing fullText equality here ran a full
+            // document compare on every status-bar render.
+            if appState.activeTab?.isDirty == true {
                 HStack(spacing: 4) {
                     Circle()
                         .fill(CMDSBrand.develop)
                         .frame(width: 6, height: 6)
-                    Text("Modified")
+                    Text("Edited")
                         .font(.system(size: 11))
                         .foregroundColor(.secondary)
                 }
+                .transition(.opacity)
+            }
+
+            if appState.settings.zoomLevel != 1.0 {
+                ZoomIndicator()
+                    .transition(.opacity)
             }
 
             ViewModeIndicator()
         }
+        .animation(.easeOut(duration: 0.15), value: appState.settings.zoomLevel == 1.0)
+        .animation(.easeOut(duration: 0.15), value: appState.activeTab?.isDirty == true)
         .padding(.horizontal, 12)
-        .frame(height: 24)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .frame(height: 26)
+        .background(.bar)
         .overlay(alignment: .top) {
             Divider()
         }
+    }
+}
+
+/// Word / character / reading-time counters, recomputed at most once per typing
+/// pause (250ms debounce via `.task(id:)`) instead of three full-document scans
+/// per keystroke on the main thread.
+struct DocumentStatsView: View {
+    let document: MarkdownDocument
+
+    @State private var wordCount = 0
+    @State private var characterCount = 0
+    @State private var hasCounted = false
+
+    private var readingTimeMinutes: Int {
+        max(1, wordCount / 200)
+    }
+
+    var body: some View {
+        HStack(spacing: 16) {
+            HStack(spacing: 4) {
+                Image(systemName: "text.word.spacing")
+                    .font(.system(size: 10))
+                Text("\(wordCount.formatted()) words")
+                    .font(.system(size: 11).monospacedDigit())
+            }
+
+            Divider()
+                .frame(height: 12)
+
+            HStack(spacing: 4) {
+                Image(systemName: "character")
+                    .font(.system(size: 10))
+                Text("\(characterCount.formatted()) chars")
+                    .font(.system(size: 11).monospacedDigit())
+            }
+
+            if wordCount > 0 {
+                Divider()
+                    .frame(height: 12)
+
+                HStack(spacing: 4) {
+                    Image(systemName: "clock")
+                        .font(.system(size: 10))
+                    Text("\(readingTimeMinutes) min read")
+                        .font(.system(size: 11).monospacedDigit())
+                }
+            }
+        }
+        .foregroundColor(.secondary)
+        .opacity(hasCounted ? 1 : 0)
+        .task(id: document.content) {
+            // First pass (document open / tab switch) counts immediately;
+            // subsequent keystrokes wait out the debounce.
+            if hasCounted {
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                guard !Task.isCancelled else { return }
+            }
+            let content = document.content
+            let counts = await Task.detached(priority: .userInitiated) {
+                (Self.countWords(in: content), content.count)
+            }.value
+            guard !Task.isCancelled else { return }
+            wordCount = counts.0
+            characterCount = counts.1
+            hasCounted = true
+        }
+    }
+
+    nonisolated static func countWords(in content: String) -> Int {
+        content.split(whereSeparator: { $0.isWhitespace || $0.isNewline }).count
     }
 }
 
@@ -79,6 +149,7 @@ struct UpdateBadge: View {
             .clipShape(Capsule())
         }
         .buttonStyle(.plain)
+        .animation(.easeOut(duration: 0.12), value: isHovering)
         .onHover { isHovering = $0 }
         .help("A new version is available — click to open the download page")
     }
@@ -94,53 +165,32 @@ struct CursorPositionView: View {
     }
 }
 
-struct WordCountView: View {
-    let document: MarkdownDocument
-    
-    var body: some View {
-        HStack(spacing: 4) {
-            Image(systemName: "text.word.spacing")
-                .font(.system(size: 10))
-                .foregroundColor(.secondary)
-            Text("\(document.wordCount) words")
-                .font(.system(size: 11))
-                .foregroundColor(.secondary)
-        }
-    }
-}
+/// Shown only while zoomed away from 100%; clicking resets to actual size.
+struct ZoomIndicator: View {
+    @Environment(AppState.self) private var appState
+    @State private var isHovering = false
 
-struct CharacterCountView: View {
-    let document: MarkdownDocument
-    
     var body: some View {
-        HStack(spacing: 4) {
-            Image(systemName: "character")
-                .font(.system(size: 10))
-                .foregroundColor(.secondary)
-            Text("\(document.characterCount) chars")
-                .font(.system(size: 11))
-                .foregroundColor(.secondary)
+        Button {
+            appState.resetZoom()
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: appState.settings.zoomLevel > 1
+                      ? "plus.magnifyingglass" : "minus.magnifyingglass")
+                    .font(.system(size: 10))
+                Text("\(Int((appState.settings.zoomLevel * 100).rounded()))%")
+                    .font(.system(size: 11).monospacedDigit())
+            }
+            .foregroundColor(isHovering ? .primary : .secondary)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(isHovering ? Color.secondary.opacity(0.15) : Color.clear)
+            .clipShape(RoundedRectangle(cornerRadius: 4))
         }
-    }
-}
-
-struct ReadingTimeView: View {
-    let document: MarkdownDocument
-    
-    private var readingTimeMinutes: Int {
-        let wordsPerMinute = 200
-        return max(1, document.wordCount / wordsPerMinute)
-    }
-    
-    var body: some View {
-        HStack(spacing: 4) {
-            Image(systemName: "clock")
-                .font(.system(size: 10))
-                .foregroundColor(.secondary)
-            Text("\(readingTimeMinutes) min read")
-                .font(.system(size: 11))
-                .foregroundColor(.secondary)
-        }
+        .buttonStyle(.plain)
+        .animation(.easeOut(duration: 0.12), value: isHovering)
+        .onHover { isHovering = $0 }
+        .help("Zoom level — click to reset to 100% (⌘0)")
     }
 }
 
@@ -177,6 +227,7 @@ struct ViewModeIndicator: View {
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
         .fixedSize()
+        .animation(.easeOut(duration: 0.12), value: isHovering)
         .onHover { isHovering = $0 }
         .help("Change view mode (⌘1 / ⌘2 / ⌘3)")
     }

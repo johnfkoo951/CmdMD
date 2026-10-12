@@ -57,6 +57,10 @@ then file it into the correct vault folder with templates and rules.
 - **Command palette** (`⌘P`) and **fully remappable shortcuts** (Settings → Shortcuts).
 - **Tabs**, split **scroll‑sync**, **drafts**, **Quick Capture** (menu bar + global hotkey),
   a frontmatter **inspector**, slug‑accurate **TOC**, and **HTML / PDF export**.
+- **Unified zoom** — `⌘=` / `⌘−` / `⌘0` or trackpad pinch scales editor and preview together.
+- **Copy on select** — finish a mouse selection and it's on your clipboard instantly;
+  rapid selections each land in clipboard‑history managers (toggleable).
+- **Diagnostics** — key actions logged to Console.app and daily files (7‑day retention).
 
 ## Install
 
@@ -84,7 +88,7 @@ cd CmdMD
 
 swift build                         # debug build
 swift run                           # run it
-swift test                          # 57 tests
+swift test                          # 67 tests
 
 swift build -c release              # release binary
 bash scripts/package_app.sh         # → dist/CmdMD.app + dist/CmdMD-macos.zip
@@ -102,6 +106,7 @@ Defaults mirror common Obsidian bindings; every action is remappable in **Settin
 | Toggle left sidebar | `⌃⌘←` | | New draft | `⌘N` |
 | Toggle right sidebar | `⌃⌘→` | | Save / Save As | `⌘S` `⇧⌘S` |
 | Copy file path | `⌥⌘C` | | Find in document | `⌘F` |
+| Zoom in / out | `⌘=` `⌘−` (or pinch) | | Actual size | `⌘0` |
 
 ## Sending to a vault
 

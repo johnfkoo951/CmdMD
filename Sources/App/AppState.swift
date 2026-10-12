@@ -62,7 +62,13 @@ final class AppState {
     var isSearching: Bool = false
 
     // Status
-    var errorMessage: String?
+    /// Every error surfaced through AppState is logged in one place here, so
+    /// call sites don't need individual Log lines next to each assignment.
+    var errorMessage: String? {
+        didSet {
+            if let errorMessage { Log.error(errorMessage) }
+        }
+    }
     var toastMessage: String?
 
     // Editor caret (for the status bar)
@@ -94,6 +100,21 @@ final class AppState {
         set {
             guard let tab = activeTab, let doc = newValue else { return }
             documents[tab.documentId] = doc
+            // Every document mutation funnels through here (typing, frontmatter
+            // edits, saves), so this is the one place the stored per-tab dirty
+            // flag stays correct — views read the flag instead of re-comparing
+            // fullText on every render.
+            refreshStoredDirty(forTabId: tab.id)
+        }
+    }
+
+    /// Recomputes and stores the dirty flag for one tab. O(n) once per actual
+    /// mutation instead of per render.
+    func refreshStoredDirty(forTabId tabId: UUID) {
+        guard let index = tabs.firstIndex(where: { $0.id == tabId }) else { return }
+        let dirty = isTabDirty(tabs[index])
+        if tabs[index].isDirty != dirty {
+            tabs[index].isDirty = dirty
         }
     }
 
@@ -158,6 +179,19 @@ final class AppState {
     /// The active binding for an action — user override or the default.
     func keyBinding(for shortcut: AppShortcut) -> KeyBinding {
         settings.keyBindings[shortcut.rawValue] ?? shortcut.defaultBinding
+    }
+
+    // MARK: - Panel toggles
+
+    /// Every entry point (menu, toolbar, palette) routes through these so the
+    /// panels always slide with the same motion instead of animating from the
+    /// menu but hard-cutting from the toolbar button.
+    func toggleSidebar() {
+        withAnimation(.snappy(duration: 0.25)) { sidebarVisible.toggle() }
+    }
+
+    func toggleInspector() {
+        withAnimation(.snappy(duration: 0.25)) { inspectorVisible.toggle() }
     }
 
     // MARK: - Update checking
@@ -233,9 +267,69 @@ final class AppState {
         showToast("Path copied")
     }
 
+    // MARK: - Zoom
+
+    /// Bounds for the unified editor/preview zoom multiplier.
+    static let zoomRange: ClosedRange<Double> = 0.5...3.0
+
+    /// Clamps to `zoomRange` and rounds to 2 decimals so pinch gestures don't
+    /// leave float dust that defeats the editor's pointSize-equality check.
+    static func clampedZoom(_ value: Double) -> Double {
+        let clamped = min(max(value, zoomRange.lowerBound), zoomRange.upperBound)
+        return (clamped * 100).rounded() / 100
+    }
+
+    func zoomIn() { setZoom(settings.zoomLevel + 0.1) }
+    func zoomOut() { setZoom(settings.zoomLevel - 0.1) }
+    func resetZoom() { setZoom(1.0) }
+
+    /// Continuous pinch input: `magnification` is the incremental delta from an
+    /// NSMagnificationGestureRecognizer / magnify(with:) event.
+    func adjustZoom(by magnification: Double) {
+        setZoom(settings.zoomLevel * (1 + magnification))
+    }
+
+    private func setZoom(_ value: Double) {
+        let clamped = Self.clampedZoom(value)
+        guard clamped != settings.zoomLevel else { return }
+        settings.zoomLevel = clamped
+        Log.info("zoom \(Int((clamped * 100).rounded()))%", .zoom)
+        scheduleSettingsSave()
+    }
+
+    /// Debounced saveUserData — pinch gestures change settings many times per
+    /// second, and each save rewrites all the data JSONs. One write 0.5s after
+    /// the last change is enough.
+    @ObservationIgnored private var settingsSaveDebounce: DispatchWorkItem?
+
+    private func scheduleSettingsSave() {
+        settingsSaveDebounce?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.saveUserData()
+        }
+        settingsSaveDebounce = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
+    }
+
+    /// Debounced persistence for high-frequency settings changes (sliders,
+    /// steppers). Each Settings tick was synchronously rewriting all 7 JSON
+    /// files; one write 0.5s after the last change is enough. Quit still
+    /// flushes synchronously via applicationShouldTerminate.
+    func saveUserDataDebounced() {
+        scheduleSettingsSave()
+    }
+
     init() {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let appDir = appSupport.appendingPathComponent("CmdMD")
+        // CMDMD_DATA_DIR points the whole data layer (settings/session/drafts…)
+        // at an alternate directory — lets dev builds run side-by-side with the
+        // installed app without touching real user data.
+        let appDir: URL
+        if let override = ProcessInfo.processInfo.environment["CMDMD_DATA_DIR"], !override.isEmpty {
+            appDir = URL(fileURLWithPath: override, isDirectory: true)
+        } else {
+            let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            appDir = appSupport.appendingPathComponent("CmdMD")
+        }
         try? FileManager.default.createDirectory(at: appDir, withIntermediateDirectories: true)
         dataURL = appDir
 
@@ -245,6 +339,8 @@ final class AppState {
         AppState.shared = self
 
         loadUserData()
+        Log.setFileLoggingEnabled(settings.fileLoggingEnabled)
+        Log.info("CmdMD \(AppInfo.version) launched", .app)
         restoreSessionIfNeeded()
         rebuildNoteIndex()
         checkForUpdates()   // silent, throttled to once per 6h
@@ -376,10 +472,14 @@ final class AppState {
 
             if inNewTab || tabs.isEmpty {
                 tabs.append(tab)
-            } else if let activeIndex = tabs.firstIndex(where: { $0.id == activeTabId }) {
+            } else if let activeIndex = tabs.firstIndex(where: { $0.id == activeTabId }),
+                      !tabs[activeIndex].isPinned,
+                      !isTabDirty(tabs[activeIndex]) {
                 // Replacing the active tab in place: release the previous
                 // document and cancel its file watcher so we don't leak file
                 // descriptors or orphan documents/originalContents entries.
+                // Pinned or dirty tabs are never replaced — silently discarding
+                // unsaved edits (or a deliberately pinned note) would be data loss.
                 let oldTab = tabs[activeIndex]
                 stopWatchingFile(for: oldTab.id)
                 documents.removeValue(forKey: oldTab.documentId)
@@ -394,6 +494,7 @@ final class AppState {
             startWatchingFile(at: url, for: tab.id)
             harvestTags(from: document)
             saveSession()
+            Log.info("opened \(url.lastPathComponent)", .file)
         } catch {
             errorMessage = "Failed to open file: \(error.localizedDescription)"
         }
@@ -575,6 +676,7 @@ final class AppState {
                     documents[tab.documentId] = fresh
                     originalContents[tab.documentId] = fresh.fullText
                 }
+                refreshStoredDirty(forTabId: tab.id)
                 showToast("Reloaded from disk")
             } catch {
                 errorMessage = "Failed to reload file: \(error.localizedDescription)"
@@ -676,6 +778,82 @@ final class AppState {
         }
     }
 
+    // MARK: - Sidebar file operations
+
+    /// Renames a file or folder via a standard prompt, keeping any open tab,
+    /// its file watcher, and the session in sync with the new URL.
+    func renameItem(at url: URL) {
+        let alert = NSAlert()
+        alert.messageText = "Rename \u{201C}\(url.lastPathComponent)\u{201D}"
+        alert.alertStyle = .informational
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        field.stringValue = url.deletingPathExtension().lastPathComponent
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Rename")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let newName = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !newName.isEmpty else { return }
+
+        let ext = url.pathExtension
+        let destination = url.deletingLastPathComponent()
+            .appendingPathComponent(ext.isEmpty ? newName : "\(newName).\(ext)")
+        guard destination != url else { return }
+        guard !FileManager.default.fileExists(atPath: destination.path) else {
+            errorMessage = "A file named \u{201C}\(destination.lastPathComponent)\u{201D} already exists."
+            return
+        }
+
+        do {
+            try FileManager.default.moveItem(at: url, to: destination)
+            if let index = tabs.firstIndex(where: { $0.fileURL == url }) {
+                tabs[index].fileURL = destination
+                tabs[index].title = destination.deletingPathExtension().lastPathComponent
+                if var doc = documents[tabs[index].documentId] {
+                    doc.fileURL = destination
+                    documents[tabs[index].documentId] = doc
+                }
+                startWatchingFile(at: destination, for: tabs[index].id)
+            }
+            recentFiles = recentFiles.map { $0 == url ? destination : $0 }
+            loadFileTree()
+            rebuildNoteIndex()
+            saveSession()
+            Log.info("renamed \(url.lastPathComponent) → \(destination.lastPathComponent)", .file)
+        } catch {
+            errorMessage = "Failed to rename: \(error.localizedDescription)"
+        }
+    }
+
+    func duplicateFile(at url: URL) {
+        let destination = url.uniquified()
+        do {
+            try FileManager.default.copyItem(at: url, to: destination)
+            loadFileTree()
+            showToast("Duplicated as \(destination.lastPathComponent)")
+        } catch {
+            errorMessage = "Failed to duplicate: \(error.localizedDescription)"
+        }
+    }
+
+    /// Trashes a file or folder with feedback, closing any tabs that were
+    /// showing content under the trashed path.
+    func moveItemToTrash(at url: URL) {
+        do {
+            try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+            for tab in tabs where tab.fileURL == url || tab.fileURL?.path.hasPrefix(url.path + "/") == true {
+                closeTab(tab)
+            }
+            loadFileTree()
+            showToast("Moved to Trash")
+            Log.info("trashed \(url.lastPathComponent)", .file)
+        } catch {
+            errorMessage = "Failed to move to Trash: \(error.localizedDescription)"
+        }
+    }
+
     // MARK: - Saving
 
     @MainActor
@@ -695,6 +873,7 @@ final class AppState {
                     current.modifiedAt = Date()
                     currentDocument = current
                 }
+                Log.info("saved \(url.lastPathComponent)", .file)
                 showToast("Saved")
             } catch {
                 errorMessage = "Failed to save: \(error.localizedDescription)"
@@ -754,6 +933,7 @@ final class AppState {
             do {
                 try await fileService.saveDocument(doc, to: url)
                 originalContents[tab.documentId] = doc.fullText
+                refreshStoredDirty(forTabId: tab.id)
             } catch {
                 errorMessage = "Failed to save \(tab.displayTitle): \(error.localizedDescription)"
             }
@@ -761,17 +941,22 @@ final class AppState {
     }
 
     func updateContent(_ newContent: String) {
-        currentDocument?.content = newContent
-        currentDocument?.modifiedAt = Date()
-        if let tabId = activeTabId, let index = tabs.firstIndex(where: { $0.id == tabId }) {
-            tabs[index].isDirty = isDirty
-        }
+        guard var document = currentDocument, document.content != newContent else { return }
+        let now = Date()
+        document.content = newContent
+        document.modifiedAt = now
+        // Commit the document once. Optional-chaining the two fields separately
+        // invoked the computed-property setter twice per keystroke, which also
+        // performed dirty-state work and notified the SwiftUI observation graph
+        // twice for one edit.
+        currentDocument = document
+        // The currentDocument setter refreshes the stored dirty flag.
         // Keep the backing draft in sync while a draft is being edited so its
         // content survives restarts even without an explicit save.
-        if let doc = currentDocument, doc.isDraft,
-           let draftIndex = drafts.firstIndex(where: { $0.id == doc.id }) {
+        if document.isDraft,
+           let draftIndex = drafts.firstIndex(where: { $0.id == document.id }) {
             drafts[draftIndex].body = newContent
-            drafts[draftIndex].updatedAt = Date()
+            drafts[draftIndex].updatedAt = now
             scheduleDraftPersist()
         }
         scheduleAutosaveIfNeeded()
@@ -972,7 +1157,23 @@ final class AppState {
               let targetIndex = tabs.firstIndex(where: { $0.id == targetId }) else { return }
         let tab = tabs.remove(at: sourceIndex)
         let insertIndex = sourceIndex < targetIndex ? targetIndex - 1 : targetIndex
-        tabs.insert(tab, at: insertIndex)
+        tabs.insert(tab, at: clampedTabInsertIndex(insertIndex, isPinned: tab.isPinned))
+    }
+
+    /// Drop target for the empty trailing area of the tab bar — without it a
+    /// tab could never be dragged to the last position.
+    func moveTabToEnd(id: UUID) {
+        guard let sourceIndex = tabs.firstIndex(where: { $0.id == id }) else { return }
+        let tab = tabs.remove(at: sourceIndex)
+        tabs.insert(tab, at: clampedTabInsertIndex(tabs.count, isPinned: tab.isPinned))
+    }
+
+    /// Pinned tabs form a fixed prefix: unpinned tabs can't land inside it, and
+    /// pinned tabs can't drift past it.
+    private func clampedTabInsertIndex(_ index: Int, isPinned: Bool) -> Int {
+        let pinnedCount = tabs.prefix(while: \.isPinned).count
+        let clamped = isPinned ? min(index, pinnedCount) : max(index, pinnedCount)
+        return min(max(0, clamped), tabs.count)
     }
 
     func selectNextTab() {
@@ -998,11 +1199,13 @@ final class AppState {
 
     func exportAsHTML() {
         guard let document = currentDocument else { return }
+        Log.info("export HTML: \(document.displayTitle)", .file)
         exportService.saveHTML(document: document, options: renderOptions())
     }
 
     func exportAsPDF() {
         guard let document = currentDocument else { return }
+        Log.info("export PDF: \(document.displayTitle)", .file)
         exportService.savePDF(document: document, options: renderOptions())
     }
 
@@ -1033,6 +1236,9 @@ final class AppState {
         if recentFiles.count > 20 {
             recentFiles = Array(recentFiles.prefix(20))
         }
+        // Feeds the system-managed recents: Dock icon right-click menu and the
+        // Apple menu's Recent Items — the in-app Open Recent stays app-managed.
+        NSDocumentController.shared.noteNewRecentDocumentURL(url)
         saveUserData()
     }
 
@@ -1086,10 +1292,13 @@ final class AppState {
         let lowercaseQuery = query.lowercased()
         let maxResults = 500
 
-        // Pull all URLs up front: iterating an enumerator directly is a
-        // makeIterator call that's unavailable from async contexts in Swift 6.
-        let fileURLs = enumerator.allObjects.compactMap { $0 as? URL }
-        for fileURL in fileURLs {
+        // Stream the enumerator instead of first materializing the entire file
+        // tree. Omnisearch cancels its previous Task as the query changes; the
+        // checks below let that cancellation stop disk reads instead of leaving
+        // several stale multi-second vault searches running concurrently.
+        while let object = enumerator.nextObject() {
+            guard !Task.isCancelled else { return [] }
+            guard let fileURL = object as? URL else { continue }
             guard fileURL.pathExtension.lowercased() == "md" || fileURL.pathExtension.lowercased() == "markdown" else { continue }
 
             do {
@@ -1097,6 +1306,7 @@ final class AppState {
                 let lines = content.components(separatedBy: .newlines)
 
                 for (index, line) in lines.enumerated() {
+                    guard !Task.isCancelled else { return [] }
                     if let range = line.lowercased().range(of: lowercaseQuery) {
                         results.append(SearchResult(
                             fileURL: fileURL,
@@ -1213,6 +1423,8 @@ final class AppState {
             }
         }
 
+        Log.info("sent \(targetURL.lastPathComponent) → \(vault.displayName)/\(options.targetFolder) (\(options.action == .move ? "move" : "copy"))", .send)
+
         if !quiet { showToast("Sent to \(vault.displayName)") }
 
         if options.openAfterSend, let obsidianURL = vault.obsidianURL(forFile: targetURL) {
@@ -1260,10 +1472,12 @@ final class AppState {
         guard let document = currentDocument else { return }
         guard let rule = matchingRoutingRule(for: document),
               let vault = vaults.first(where: { $0.id == rule.targetVaultId }) else {
+            Log.info("auto-route: no rule matched for \(document.displayTitle)", .send)
             showToast("No routing rule matches — opening Send dialog")
             showSendToVault = true
             return
         }
+        Log.info("auto-route: rule '\(rule.name)' matched \(document.displayTitle)", .send)
 
         var options = SendOptions()
         options.targetVault = vault
@@ -1355,6 +1569,7 @@ final class AppState {
               let data = try? Data(contentsOf: sessionURL),
               let session = try? JSONDecoder().decode(SessionState.self, from: data) else { return }
 
+        Log.info("restoring session: \(session.openFiles.count) file(s)", .app)
         viewMode = session.viewMode
         sidebarVisible = session.sidebarVisible
         inspectorVisible = session.inspectorVisible
@@ -1413,6 +1628,7 @@ final class AppState {
             }
         }
 
+        Log.setFileLoggingEnabled(settings.fileLoggingEnabled)
         save(settings, to: "settings.json")
         save(vaults, to: "vaults.json")
         save(recentFiles, to: "recents.json")

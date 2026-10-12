@@ -1,12 +1,19 @@
 import SwiftUI
 
+/// CmdMD owns document tabs itself, so the app has exactly one editor window.
+/// Keeping the scene id in one place also lets the menu-bar extra reopen that
+/// same window instead of asking SwiftUI to create another editor scene.
+enum AppWindowPolicy {
+    static let mainSceneID = "main"
+}
+
 @main
 struct CmdMDApp: App {
     @State private var appState = AppState()
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     
     var body: some Scene {
-        WindowGroup {
+        Window("CmdMD", id: AppWindowPolicy.mainSceneID) {
             ContentView()
                 .environment(appState)
                 .onOpenURL { url in
@@ -16,8 +23,10 @@ struct CmdMDApp: App {
                     handleDrop(providers)
                 }
         }
-        .windowStyle(.hiddenTitleBar)
-        .windowToolbarStyle(.unified(showsTitle: false))
+        // Title + document proxy icon in the unified toolbar — the strongest
+        // native-document signals (draggable icon, ⌘-click path menu). The
+        // proxy icon itself comes from .navigationDocument in ContentView.
+        .windowToolbarStyle(.unified(showsTitle: true))
         .defaultSize(width: appState.settings.defaultWindowWidth, height: appState.settings.defaultWindowHeight)
         .commands {
             CommandGroup(replacing: .appInfo) {
@@ -38,12 +47,12 @@ struct CmdMDApp: App {
 
                 Divider()
 
-                Button("Open File...") {
+                Button("Open…") {
                     appState.openFile()
                 }
                 .keyboardShortcut("o", modifiers: .command)
 
-                Button("Open Folder...") {
+                Button("Open Folder…") {
                     appState.openFolder()
                 }
                 .appShortcut(appState.keyBinding(for: .openFolder))
@@ -55,31 +64,31 @@ struct CmdMDApp: App {
                 .disabled(appState.currentDocument?.fileURL == nil)
 
                 Divider()
-                
+
                 Menu("Open Recent") {
                     ForEach(appState.recentFiles.prefix(10), id: \.self) { url in
                         Button(url.lastPathComponent) {
                             appState.openDocument(at: url)
                         }
                     }
-                    
+
                     if !appState.recentFiles.isEmpty {
                         Divider()
-                        Button("Clear Recent") {
+                        Button("Clear Menu") {
                             appState.clearRecentFiles()
                         }
                     }
                 }
             }
-            
+
             CommandGroup(replacing: .saveItem) {
                 Button("Save") {
                     Task { await appState.saveCurrentDocument() }
                 }
                 .appShortcut(appState.keyBinding(for: .save))
-                .disabled(!appState.isDirty)
+                .disabled(appState.activeTab?.isDirty != true)
 
-                Button("Save As...") {
+                Button("Save As…") {
                     Task { await appState.saveDocumentAs() }
                 }
                 .appShortcut(appState.keyBinding(for: .saveAs))
@@ -90,82 +99,100 @@ struct CmdMDApp: App {
                 }
                 .appShortcut(appState.keyBinding(for: .copyFilePath))
                 .disabled(appState.currentDocument?.fileURL == nil)
-                
+
                 Divider()
-                
-                Button("Export as HTML...") {
+
+                Button("Export as HTML…") {
                     appState.exportAsHTML()
                 }
                 .keyboardShortcut("e", modifiers: [.command, .shift])
                 .disabled(appState.currentDocument == nil)
-                
-                Button("Export as PDF...") {
+
+                Button("Export as PDF…") {
                     appState.exportAsPDF()
                 }
                 .disabled(appState.currentDocument == nil)
-                
+
                 Button("Copy as HTML") {
                     appState.copyAsHTML()
                 }
                 .disabled(appState.currentDocument == nil)
             }
-            
+
             CommandMenu("View") {
-                Button("Source Only") {
-                    appState.viewMode = .source
-                }
-                .appShortcut(appState.keyBinding(for: .sourceMode))
+                // Toggles (not Buttons) so the active mode carries the native
+                // menu checkmark.
+                Toggle("Source Only", isOn: viewModeBinding(.source))
+                    .appShortcut(appState.keyBinding(for: .sourceMode))
 
-                Button("Split View") {
-                    appState.viewMode = .split
-                }
-                .appShortcut(appState.keyBinding(for: .splitMode))
+                Toggle("Split View", isOn: viewModeBinding(.split))
+                    .appShortcut(appState.keyBinding(for: .splitMode))
 
-                Button("Preview Only") {
-                    appState.viewMode = .preview
-                }
-                .appShortcut(appState.keyBinding(for: .previewMode))
+                Toggle("Preview Only", isOn: viewModeBinding(.preview))
+                    .appShortcut(appState.keyBinding(for: .previewMode))
 
                 Divider()
 
-                Button("Toggle Sidebar") {
-                    withAnimation {
-                        appState.sidebarVisible.toggle()
-                    }
+                // HIG order: Actual Size above Zoom In/Out (Safari, Preview, Notes).
+                Button("Actual Size") {
+                    appState.resetZoom()
+                }
+                .appShortcut(appState.keyBinding(for: .resetZoom))
+                .disabled(appState.settings.zoomLevel == 1.0)
+
+                Button("Zoom In") {
+                    appState.zoomIn()
+                }
+                .appShortcut(appState.keyBinding(for: .zoomIn))
+
+                Button("Zoom Out") {
+                    appState.zoomOut()
+                }
+                .appShortcut(appState.keyBinding(for: .zoomOut))
+
+                Divider()
+
+                Button(appState.sidebarVisible ? "Hide Sidebar" : "Show Sidebar") {
+                    appState.toggleSidebar()
                 }
                 .appShortcut(appState.keyBinding(for: .toggleSidebar))
 
-                Button("Toggle Inspector") {
-                    withAnimation {
-                        appState.inspectorVisible.toggle()
-                    }
+                Button(appState.inspectorVisible ? "Hide Inspector" : "Show Inspector") {
+                    appState.toggleInspector()
                 }
                 .appShortcut(appState.keyBinding(for: .toggleInspector))
-                
+
                 Divider()
-                
-                Button("Toggle Tab Bar") {
+
+                Button(appState.settings.showTabBar ? "Hide Tab Bar" : "Show Tab Bar") {
                     appState.settings.showTabBar.toggle()
                 }
-                
-                Button("Toggle Status Bar") {
+
+                Button(appState.settings.showStatusBar ? "Hide Status Bar" : "Show Status Bar") {
                     appState.settings.showStatusBar.toggle()
                 }
             }
-            
+
             CommandMenu("Tab") {
                 Button("New Tab") {
                     appState.createNewTab()
                 }
                 .keyboardShortcut("t", modifiers: .command)
-                
-                Button("Close Tab") {
+
+                Button(appState.tabs.isEmpty ? "Close Window" : "Close Tab") {
                     if let tab = appState.activeTab {
-                        appState.closeTab(tab)
+                        // Route through the dirty-tab guard — the menu item
+                        // previously discarded unsaved changes silently.
+                        if tab.isDirty && appState.settings.confirmBeforeClosingDirtyTabs {
+                            appState.closeTabWithConfirmation(tab)
+                        } else {
+                            appState.closeTab(tab)
+                        }
+                    } else {
+                        NSApp.keyWindow?.performClose(nil)
                     }
                 }
                 .keyboardShortcut("w", modifiers: .command)
-                .disabled(appState.tabs.isEmpty)
                 
                 Divider()
                 
@@ -210,27 +237,27 @@ struct CmdMDApp: App {
             }
 
             CommandMenu("Find") {
-                Button("Omnisearch...") {
+                Button("Omnisearch…") {
                     appState.showOmnisearch = true
                 }
                 .appShortcut(appState.keyBinding(for: .omnisearch))
 
                 Divider()
 
-                Button("Find in Document...") {
+                Button("Find in Document…") {
                     NotificationCenter.default.post(name: .showDocumentSearch, object: nil)
                 }
                 .appShortcut(appState.keyBinding(for: .findInDocument))
 
-                Button("Find in Folder...") {
+                Button("Find in Folder…") {
                     appState.selectedSidebarTab = .files
                     appState.sidebarVisible = true
                 }
                 .keyboardShortcut("f", modifiers: [.command, .shift])
             }
-            
+
             CommandMenu("Vault") {
-                Button("Send to Vault...") {
+                Button("Send to Vault…") {
                     appState.showSendToVault = true
                 }
                 .appShortcut(appState.keyBinding(for: .sendToVault))
@@ -251,12 +278,18 @@ struct CmdMDApp: App {
 
                 Divider()
 
-                Button("Manage Vaults, Templates & Rules...") {
+                Button("Manage Vaults…") {
                     appState.showVaultManager = true
                 }
             }
-            
+
             CommandGroup(replacing: .help) {
+                Button("CmdMD Help") {
+                    NSWorkspace.shared.open(URL(string: "https://cmdmd.cmdspace.work")!)
+                }
+
+                Divider()
+
                 Button("Command Palette") {
                     appState.showCommandPalette = true
                 }
@@ -279,6 +312,15 @@ struct CmdMDApp: App {
         .menuBarExtraStyle(.window)
     }
     
+    /// Menu Toggle binding for one view mode — checkmarked when active,
+    /// selecting an already-active mode is a no-op (never "unchecks").
+    private func viewModeBinding(_ mode: ViewMode) -> Binding<Bool> {
+        Binding(
+            get: { appState.viewMode == mode },
+            set: { if $0 { appState.viewMode = mode } }
+        )
+    }
+
     private func handleURL(_ url: URL) {
         if url.scheme == "cmdmd" {
             appState.openInternalURL(url)
@@ -312,6 +354,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var globalMonitor: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // The app has its own document tab bar — the system's window-tab
+        // machinery (View > Show Tab Bar, ⌘T stealing) would fight it.
+        NSWindow.allowsAutomaticWindowTabbing = false
+
         DispatchQueue.main.async { [launchDefaults] in
             guard launchDefaults.requiresRegularLaunchActivation else { return }
 
@@ -329,6 +375,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        Log.info("CmdMD terminating", .app)
         if let monitor = globalMonitor {
             NSEvent.removeMonitor(monitor)
             globalMonitor = nil
@@ -343,6 +390,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// the resident menu-bar app) discarded all dirty tabs silently.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         AppState.shared?.saveSession()
+        // Flush settings synchronously — zoom changes persist on a 0.5s
+        // debounce that would otherwise be lost by a quick ⌘Q.
+        AppState.shared?.saveUserData()
 
         guard let appState = AppState.shared,
               appState.settings.confirmBeforeClosingDirtyTabs,
@@ -350,13 +400,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return .terminateNow
         }
 
+        // Native multi-document quit pattern: default action rightmost, Cancel
+        // beside it, and the destructive choice farthest from the default.
+        let dirtyCount = appState.tabs.filter { appState.isTabDirty($0) }.count
         let alert = NSAlert()
-        alert.messageText = "You have unsaved changes"
+        alert.messageText = dirtyCount == 1
+            ? "You have 1 document with unsaved changes"
+            : "You have \(dirtyCount) documents with unsaved changes"
         alert.informativeText = "Do you want to save your changes before quitting?"
         alert.alertStyle = .warning
         alert.addButton(withTitle: "Save All")
-        alert.addButton(withTitle: "Discard")
-        alert.addButton(withTitle: "Cancel")
+        let cancel = alert.addButton(withTitle: "Cancel")
+        cancel.keyEquivalent = "\u{1b}"
+        let discard = alert.addButton(withTitle: "Discard Changes")
+        discard.hasDestructiveAction = true
 
         switch alert.runModal() {
         case .alertFirstButtonReturn:
@@ -365,7 +422,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 NSApplication.shared.reply(toApplicationShouldTerminate: true)
             }
             return .terminateLater
-        case .alertSecondButtonReturn:
+        case .alertThirdButtonReturn:
             return .terminateNow
         default:
             return .terminateCancel

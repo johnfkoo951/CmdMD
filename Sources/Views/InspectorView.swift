@@ -50,41 +50,28 @@ struct InspectorView: View {
                 ContentUnavailableView("No Document", systemImage: "doc.text", description: Text("Open a file to see its details"))
             }
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        // No opaque background — the system inspector supplies its own
+        // translucent material, which painting windowBackgroundColor destroyed.
     }
 }
 
+/// Native segmented switcher — the previous custom underline tab bar read as
+/// web/iOS chrome inside a macOS inspector panel.
 struct InspectorTabBar: View {
     @Binding var selectedTab: InspectorTab
-    
+
     var body: some View {
-        HStack(spacing: 0) {
+        Picker("Inspector Section", selection: $selectedTab) {
             ForEach(InspectorTab.allCases, id: \.self) { tab in
-                Button {
-                    selectedTab = tab
-                } label: {
-                    VStack(spacing: 4) {
-                        Image(systemName: tab.icon)
-                            .font(.system(size: 14))
-                        Text(tab.rawValue)
-                            .font(.system(size: 10))
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 8)
-                    .foregroundStyle(selectedTab == tab ? Color.cmdsAccent : Color.secondary)
-                    .overlay(alignment: .bottom) {
-                        if selectedTab == tab {
-                            Rectangle()
-                                .fill(Color.cmdsAccent)
-                                .frame(height: 2)
-                        }
-                    }
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
+                Image(systemName: tab.icon)
+                    .help(tab.rawValue)
+                    .tag(tab)
             }
         }
-        .frame(height: 50)
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
     }
 }
 
@@ -196,7 +183,10 @@ struct SendSection: View {
 struct InspectorBottomSection: View {
     @Environment(AppState.self) private var appState
     @State private var showingInfo: Bool = false
-    
+    @State private var wordCount = 0
+    @State private var characterCount = 0
+    @State private var hasCounted = false
+
     var body: some View {
         VStack(spacing: 0) {
             HStack {
@@ -211,25 +201,25 @@ struct InspectorBottomSection: View {
                     .foregroundStyle(showingInfo ? Color.cmdsAccent : Color.secondary)
                 }
                 .buttonStyle(.plain)
-                
+
                 Spacer()
-                
-                if let document = appState.currentDocument {
-                    Text("\(document.wordCount) words")
-                        .font(.caption)
+
+                if appState.currentDocument != nil {
+                    Text("\(wordCount.formatted()) words")
+                        .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
                 }
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
-            
+
             if showingInfo, let document = appState.currentDocument {
                 Divider()
                 VStack(alignment: .leading, spacing: 6) {
-                    CompactInfoRow(label: "Characters", value: "\(document.characterCount)")
+                    CompactInfoRow(label: "Characters", value: characterCount.formatted())
                     CompactInfoRow(label: "Modified", value: document.modifiedAt.formatted(.dateTime.month().day().hour().minute()))
                     if let url = document.fileURL {
-                        CompactInfoRow(label: "Path", value: url.path)
+                        CompactInfoRow(label: "Path", value: (url.path as NSString).abbreviatingWithTildeInPath)
                     }
                 }
                 .padding(.horizontal, 12)
@@ -238,6 +228,18 @@ struct InspectorBottomSection: View {
             }
         }
         .animation(.easeInOut(duration: 0.2), value: showingInfo)
+        // Debounced like the status bar — full-document counting per keystroke
+        // with the inspector open was pure main-thread waste.
+        .task(id: appState.currentDocument?.content ?? "") {
+            guard let content = appState.currentDocument?.content else { return }
+            if hasCounted {
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                guard !Task.isCancelled else { return }
+            }
+            wordCount = DocumentStatsView.countWords(in: content)
+            characterCount = content.count
+            hasCounted = true
+        }
     }
 }
 
@@ -264,10 +266,11 @@ struct TableOfContentsSection: View {
 
     // Shared with the renderer (fence-aware, deduplicating slugger) so a TOC
     // click always lands on the right anchor — including duplicate and Korean
-    // headings.
-    private var headings: [TOCHeading] {
-        TOCBuilder.extractHeadings(from: document.content)
-    }
+    // headings. Debounced: with the inspector open, re-parsing the whole
+    // document on every keystroke (twice — isEmpty check + ForEach) was a
+    // measurable slice of typing latency.
+    @State private var headings: [TOCHeading] = []
+    @State private var hasParsed = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -285,6 +288,14 @@ struct TableOfContentsSection: View {
                     }
                 }
             }
+        }
+        .task(id: document.content) {
+            if hasParsed {
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                guard !Task.isCancelled else { return }
+            }
+            headings = TOCBuilder.extractHeadings(from: document.content)
+            hasParsed = true
         }
     }
 }

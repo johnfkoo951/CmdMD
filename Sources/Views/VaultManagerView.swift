@@ -150,6 +150,7 @@ struct VaultDetailView: View {
     @State private var isDefault: Bool = false
     @State private var availableFolders: [String] = []
     @State private var noteCount: Int?
+    @State private var confirmingDisconnect = false
 
     private var isObsidianVault: Bool {
         ObsidianLocator.isObsidianVault(vault.rootPath)
@@ -256,9 +257,21 @@ struct VaultDetailView: View {
                 }
 
                 Button(role: .destructive) {
-                    appState.removeVault(vault)
+                    confirmingDisconnect = true
                 } label: {
                     Label("Disconnect Vault", systemImage: "minus.circle")
+                }
+                .confirmationDialog(
+                    "Disconnect \u{201C}\(vault.displayName)\u{201D}?",
+                    isPresented: $confirmingDisconnect,
+                    titleVisibility: .visible
+                ) {
+                    Button("Disconnect", role: .destructive) {
+                        appState.removeVault(vault)
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("Routing rules targeting this vault are removed too. Files in the vault are not touched.")
                 }
             }
         }

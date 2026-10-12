@@ -201,6 +201,33 @@ class MarkdownRenderer {
         options: []
     )
 
+    /// Precompiled masking expressions. Rendering runs frequently while the
+    /// user types, so compiling these on every pass is unnecessary work.
+    private static let fencedCodePattern = try! NSRegularExpression(
+        pattern: "(?m)^[ \\t]*```[\\s\\S]*?^[ \\t]*```"
+    )
+    private static let inlineCodePattern = try! NSRegularExpression(
+        pattern: "`[^`\\n]+`"
+    )
+    private static let displayDollarMathPattern = try! NSRegularExpression(
+        pattern: #"\$\$[\s\S]+?\$\$"#
+    )
+    private static let displayBracketMathPattern = try! NSRegularExpression(
+        pattern: #"\\\[[\s\S]+?\\\]"#
+    )
+    private static let inlineParenMathPattern = try! NSRegularExpression(
+        pattern: #"\\\([\s\S]+?\\\)"#
+    )
+    private static let inlineDollarMathPattern = try! NSRegularExpression(
+        pattern: #"\$[^$\n]+\$"#
+    )
+    private static let codeTokenPattern = try! NSRegularExpression(
+        pattern: "\u{E000}CMDMDCODE\\d+\u{E000}"
+    )
+    private static let mathTokenPattern = try! NSRegularExpression(
+        pattern: "\u{E000}CMDMDMATH\\d+\u{E000}"
+    )
+
     func renderToHTML(markdown: String, baseURL: URL? = nil, options: MarkdownRenderOptions = MarkdownRenderOptions()) -> String {
         // Task-line scan runs against the untouched source, before any
         // transformation can shift line numbers.
@@ -237,9 +264,12 @@ class MarkdownRenderer {
 
         // Math placeholders come back as escaped literal `$...$` text; the
         // KaTeX auto-render script picks them up from the DOM.
-        for (token, original) in mathTokens {
-            htmlBody = htmlBody.replacingOccurrences(of: token, with: htmlEscape(original))
-        }
+        htmlBody = restoreRegions(
+            in: htmlBody,
+            tokens: mathTokens,
+            matching: Self.mathTokenPattern,
+            transform: htmlEscape
+        )
 
         return wrapWithHTML(body: htmlBody, options: options)
     }
@@ -257,63 +287,116 @@ class MarkdownRenderer {
     /// so downstream regex pre-processing leaves code untouched. Restored before
     /// the Markdown parse so the code blocks render (and escape) normally.
     private func maskCodeRegions(_ markdown: String) -> (String, [String: String]) {
-        var tokens: [String: String] = [:]
-        var index = 0
-        var result = markdown
-
-        func mask(_ pattern: String) {
-            guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else { return }
-            while true {
-                let ns = result as NSString
-                guard let match = regex.firstMatch(in: result, range: NSRange(location: 0, length: ns.length)) else { break }
-                let token = "\u{E000}CMDMDCODE\(index)\u{E000}"
-                tokens[token] = ns.substring(with: match.range)
-                result = ns.replacingCharacters(in: match.range, with: token)
-                index += 1
-            }
-        }
-
         // Line-anchored fences (``` at the start of a line, optional indent) so a
         // stray inline ``` can't pair with a real fence and swallow content
         // between two separate code blocks.
-        mask("(?m)^[ \\t]*```[\\s\\S]*?^[ \\t]*```")   // fenced code blocks
-        mask("`[^`\n]+`")                                // inline code
-        return (result, tokens)
+        return maskRegions(
+            in: markdown,
+            patterns: [Self.fencedCodePattern, Self.inlineCodePattern],
+            tokenPrefix: "CMDMDCODE"
+        )
     }
 
     /// Masks `$$display$$` and `$inline$` math with placeholder tokens. Inline
     /// math must be single-line and non-empty so a lone dollar sign in prose
     /// doesn't start a bogus math region.
     private func maskMathRegions(_ markdown: String) -> (String, [String: String]) {
+        maskRegions(
+            in: markdown,
+            patterns: [
+                Self.displayDollarMathPattern,
+                Self.displayBracketMathPattern,
+                Self.inlineParenMathPattern,
+                Self.inlineDollarMathPattern
+            ],
+            tokenPrefix: "CMDMDMATH"
+        )
+    }
+
+    /// Masks every non-overlapping match from each expression in one forward
+    /// pass. The previous first-match loop rebuilt the entire String once per
+    /// code span, making code-heavy documents progressively slower.
+    private func maskRegions(
+        in source: String,
+        patterns: [NSRegularExpression],
+        tokenPrefix: String
+    ) -> (String, [String: String]) {
         var tokens: [String: String] = [:]
         var index = 0
-        var result = markdown
+        var result = source
 
-        func mask(_ pattern: String) {
-            guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else { return }
-            while true {
-                let ns = result as NSString
-                guard let match = regex.firstMatch(in: result, range: NSRange(location: 0, length: ns.length)) else { break }
-                let token = "\u{E000}CMDMDMATH\(index)\u{E000}"
-                tokens[token] = ns.substring(with: match.range)
-                result = ns.replacingCharacters(in: match.range, with: token)
+        for pattern in patterns {
+            let original = result as NSString
+            let matches = pattern.matches(
+                in: result,
+                range: NSRange(location: 0, length: original.length)
+            )
+            guard !matches.isEmpty else { continue }
+
+            var masked = ""
+            masked.reserveCapacity(result.utf8.count)
+            var cursor = 0
+
+            for match in matches {
+                let token = "\u{E000}\(tokenPrefix)\(index)\u{E000}"
+                tokens[token] = original.substring(with: match.range)
+                masked += original.substring(
+                    with: NSRange(location: cursor, length: match.range.location - cursor)
+                )
+                masked += token
+                cursor = NSMaxRange(match.range)
                 index += 1
             }
+            masked += original.substring(
+                with: NSRange(location: cursor, length: original.length - cursor)
+            )
+            result = masked
         }
 
-        mask(#"\$\$[\s\S]+?\$\$"#)        // display math  $$ … $$
-        mask(#"\\\[[\s\S]+?\\\]"#)        // display math  \[ … \]
-        mask(#"\\\([\s\S]+?\\\)"#)        // inline math   \( … \)
-        mask(#"\$[^$\n]+\$"#)             // inline math   $ … $
         return (result, tokens)
     }
 
     private func restoreCodeRegions(_ markdown: String, tokens: [String: String]) -> String {
-        var result = markdown
-        for (token, original) in tokens {
-            result = result.replacingOccurrences(of: token, with: original)
+        restoreRegions(
+            in: markdown,
+            tokens: tokens,
+            matching: Self.codeTokenPattern,
+            transform: { $0 }
+        )
+    }
+
+    /// Restores every placeholder in one forward pass. Replacing dictionary
+    /// entries one at a time copied the full document once per token, undoing
+    /// the benefit of batched masking for code-heavy notes.
+    private func restoreRegions(
+        in source: String,
+        tokens: [String: String],
+        matching pattern: NSRegularExpression,
+        transform: (String) -> String
+    ) -> String {
+        let original = source as NSString
+        let matches = pattern.matches(
+            in: source,
+            range: NSRange(location: 0, length: original.length)
+        )
+        guard !matches.isEmpty else { return source }
+
+        var restored = ""
+        restored.reserveCapacity(source.utf8.count)
+        var cursor = 0
+
+        for match in matches {
+            restored += original.substring(
+                with: NSRange(location: cursor, length: match.range.location - cursor)
+            )
+            let token = original.substring(with: match.range)
+            restored += tokens[token].map(transform) ?? token
+            cursor = NSMaxRange(match.range)
         }
-        return result
+        restored += original.substring(
+            with: NSRange(location: cursor, length: original.length - cursor)
+        )
+        return restored
     }
 
     // MARK: Obsidian extensions
@@ -551,7 +634,12 @@ class MarkdownRenderer {
             }
             """ : ""
 
-        let katexIncludes = options.enableKaTeX ? """
+        // Gate KaTeX on actual math markers (like mermaid/hljs above) — loading
+        // four resources plus a whole-body DOM scan on every math-free note
+        // added latency to each debounced reload. `$` survives into the body,
+        // so a contains check is a safe over-approximation.
+        let hasMath = body.contains("$") || body.contains("\\(") || body.contains("\\[")
+        let katexIncludes = (options.enableKaTeX && hasMath) ? """
             <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16/dist/katex.min.css">
             <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16/dist/katex.min.js"></script>
             <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16/dist/contrib/mhchem.min.js"></script>
@@ -587,7 +675,9 @@ class MarkdownRenderer {
         <head>
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <meta name="color-scheme" content="light dark">
             <style>
+                :root { color-scheme: light dark; }
                 \(options.theme.css)
                 \(obsidianExtensionsCSS)
                 \(mermaidCSS)
@@ -684,6 +774,19 @@ class MarkdownRenderer {
 
     private var obsidianExtensionsCSS: String {
         """
+        /* One native mono stack for every theme — ui-monospace resolves to SF
+           Mono on macOS; themes without an explicit stack fell back to Courier. */
+        code, pre, kbd, samp {
+            font-family: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Monaco, monospace;
+        }
+        /* Task checkboxes: native control tinted with the theme accent, sized
+           to sit on the text baseline instead of a raw default form control. */
+        input[type="checkbox"] {
+            accent-color: var(--link-color, #007aff);
+            width: 14px;
+            height: 14px;
+            vertical-align: -2px;
+        }
         .wiki-link {
             color: var(--link-color, #134538);
             text-decoration: none;

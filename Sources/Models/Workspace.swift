@@ -98,14 +98,15 @@ struct FavoriteItem: Identifiable, Equatable, Codable {
 // MARK: - File Tree
 
 struct FileTreeItem: Identifiable, Hashable {
-    let id: UUID
+    /// Identity IS the path — a fresh UUID per tree rebuild made SwiftUI treat
+    /// every refresh as all-new rows (row churn, lost disclosure animations).
+    var id: URL { url }
     let url: URL
     let isDirectory: Bool
     var isExpanded: Bool
     var children: [FileTreeItem]
 
     init(url: URL, isDirectory: Bool = false, isExpanded: Bool = false, children: [FileTreeItem] = []) {
-        self.id = UUID()
         self.url = url
         self.isDirectory = isDirectory
         self.isExpanded = isExpanded
@@ -131,11 +132,11 @@ struct FileTreeItem: Identifiable, Hashable {
     }
 
     func hash(into hasher: inout Hasher) {
-        hasher.combine(id)
+        hasher.combine(url)
     }
 
     static func == (lhs: FileTreeItem, rhs: FileTreeItem) -> Bool {
-        lhs.id == rhs.id
+        lhs.url == rhs.url && lhs.isExpanded == rhs.isExpanded && lhs.children == rhs.children
     }
 }
 

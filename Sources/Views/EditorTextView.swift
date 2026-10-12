@@ -11,16 +11,21 @@ extension Notification.Name {
 /// scroll-to-line are O(log n) lookups instead of rescanning the document.
 final class LineIndex {
     private(set) var newlinePositions: [Int] = []
+    /// Reused scan buffer — rebuilding runs on every keystroke, so a fresh
+    /// 2×docSize allocation per keypress is real steady-state garbage.
+    private var buffer: [unichar] = []
 
     func rebuild(from text: NSString) {
-        var positions: [Int] = []
         let length = text.length
         guard length > 0 else {
             newlinePositions = []
             return
         }
-        var buffer = [unichar](repeating: 0, count: length)
+        if buffer.count < length {
+            buffer = [unichar](repeating: 0, count: length)
+        }
         text.getCharacters(&buffer, range: NSRange(location: 0, length: length))
+        var positions: [Int] = []
         for i in 0..<length where buffer[i] == 0x0A {
             positions.append(i)
         }
@@ -57,10 +62,59 @@ final class LineIndex {
 
 // MARK: - Text View
 
-/// NSTextView with current-line highlighting.
+/// NSTextView with current-line highlighting, pinch-zoom forwarding, and
+/// copy-on-drag-selection.
 final class CmdMDTextView: NSTextView {
     var highlightCurrentLine = false
     var currentLineColor: NSColor = .clear
+
+    /// Pinch gesture delta sink — routes to the app-wide zoom level instead of
+    /// AppKit's default (font-panel-based) magnification behavior.
+    var onMagnify: ((CGFloat) -> Void)?
+
+    /// When set, a selection made with the mouse is copied to the clipboard the
+    /// moment the gesture ends.
+    var copySelectionOnDrag = false
+
+    override func magnify(with event: NSEvent) {
+        guard let onMagnify else {
+            super.magnify(with: event)
+            return
+        }
+        onMagnify(event.magnification)
+    }
+
+    /// NSTextView's mouseDown runs a modal tracking loop that returns exactly
+    /// at mouse-up, so "after super returns" IS the end of a drag selection
+    /// (and of double/triple-click selections). Copying here — never during the
+    /// drag — means each completed selection lands on the pasteboard as one
+    /// distinct change that clipboard-history managers can capture, with no
+    /// delay between rapid successive selections.
+    override func mouseDown(with event: NSEvent) {
+        let selectionBefore = selectedRange()
+        super.mouseDown(with: event)
+        guard copySelectionOnDrag else { return }
+        let selection = selectedRange()
+        guard selection.length > 0, selection != selectionBefore else { return }
+        copyToPasteboard(selection)
+    }
+
+    private func copyToPasteboard(_ range: NSRange) {
+        let nsString = string as NSString
+        guard range.location + range.length <= nsString.length else { return }
+        let text = nsString.substring(with: range)
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+        Log.info("selection copied (\(text.count) chars)", .clipboard)
+    }
+
+    /// Markdown is plain text — pasting styled content (fonts, colors, image
+    /// attachments from a browser or Pages) injected invisible rich attributes
+    /// into the document. Always paste the plain-text representation.
+    override func paste(_ sender: Any?) {
+        pasteAsPlainText(sender)
+    }
 
     override func drawBackground(in rect: NSRect) {
         super.drawBackground(in: rect)
@@ -106,9 +160,25 @@ final class LineNumberRulerView: NSRulerView {
     private let lineIndex: LineIndex
 
     var numberColor: NSColor = .secondaryLabelColor { didSet { needsDisplay = true } }
+    /// The caret's line number is emphasized (Xcode-style) with this color.
+    var emphasizedNumberColor: NSColor = .labelColor { didSet { needsDisplay = true } }
     var gutterColor: NSColor = .clear { didSet { needsDisplay = true } }
 
-    private let numberFont = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+    /// Gutter digits track the editor font size so the unified zoom scales the
+    /// whole canvas, not just the text column.
+    var editorFontSize: CGFloat = 14 {
+        didSet {
+            guard abs(editorFontSize - oldValue) > 0.01 else { return }
+            numberFont = NSFont.monospacedDigitSystemFont(
+                ofSize: max(9, (editorFontSize * 0.8).rounded()),
+                weight: .regular
+            )
+            refreshThickness()
+            needsDisplay = true
+        }
+    }
+
+    private var numberFont = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
 
     init(textView: NSTextView, lineIndex: LineIndex) {
         self.textView = textView
@@ -139,12 +209,16 @@ final class LineNumberRulerView: NSRulerView {
               let layoutManager = textView.layoutManager,
               let container = textView.textContainer else { return }
 
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: numberFont,
-            .foregroundColor: numberColor
-        ]
+        // Emphasize the caret's line, matching the current-line highlight.
+        let caretLine = textView.selectedRange().length == 0
+            ? lineIndex.lineNumber(at: textView.selectedRange().location)
+            : -1
 
         func draw(_ number: Int, atTextViewY y: CGFloat, fragmentHeight: CGFloat) {
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: numberFont,
+                .foregroundColor: number == caretLine ? emphasizedNumberColor : numberColor
+            ]
             let str = NSAttributedString(string: "\(number)", attributes: attributes)
             let size = str.size()
             let point = convert(NSPoint(x: 0, y: y), from: textView)
@@ -211,8 +285,10 @@ struct MarkdownTextEditor: NSViewRepresentable {
     let insertSpacesForTab: Bool
     let enableCompletion: Bool
     let scrollSyncEnabled: Bool
+    let copySelectionOnDrag: Bool
     var onImageDrop: ((URL) -> Void)?
     var onSelectionChange: ((Int, Int) -> Void)?
+    var onMagnify: ((CGFloat) -> Void)?
     var completionsProvider: ((CompletionContext) -> [CompletionItem])?
 
     /// Clamp previously-selected ranges to the current text, measuring in UTF-16
@@ -260,6 +336,8 @@ struct MarkdownTextEditor: NSViewRepresentable {
         context.coordinator.textView = textView
         textView.delegate = context.coordinator
         textView.font = font
+        textView.copySelectionOnDrag = copySelectionOnDrag
+        textView.onMagnify = onMagnify
         textView.isRichText = true
         textView.allowsUndo = true
         textView.isAutomaticQuoteSubstitutionEnabled = false
@@ -268,7 +346,8 @@ struct MarkdownTextEditor: NSViewRepresentable {
         textView.isAutomaticSpellingCorrectionEnabled = false
         textView.isContinuousSpellCheckingEnabled = false
         textView.usesFontPanel = false
-        textView.textContainerInset = NSSize(width: 12, height: 12)
+        // Comfortable Apple-like content padding (Notes/Xcode sit around 16-20pt).
+        textView.textContainerInset = NSSize(width: 20, height: 16)
         textView.drawsBackground = true
 
         // Native find/replace bar (⌘F / ⌘⌥F).
@@ -280,9 +359,12 @@ struct MarkdownTextEditor: NSViewRepresentable {
 
         textView.registerForDraggedTypes([.fileURL, .png, .tiff])
 
-        textView.string = text
+        // Index BEFORE installing the text: setting `string` fires a selection
+        // change, and reporting it against an empty index produced "Ln 1,
+        // Col <doc length>" in the status bar until the first click.
         context.coordinator.currentDocumentID = documentID
         context.coordinator.lineIndex.rebuild(from: text as NSString)
+        textView.string = text
         context.coordinator.applyHighlightingNow()
 
         // Line-number gutter.
@@ -307,6 +389,8 @@ struct MarkdownTextEditor: NSViewRepresentable {
 
         applyTheme(to: textView, scrollView: nsView)
         textView.font = font
+        textView.copySelectionOnDrag = copySelectionOnDrag
+        textView.onMagnify = onMagnify
         applyWrapMode(to: textView, scrollView: nsView)
 
         nsView.rulersVisible = showLineNumbers
@@ -356,7 +440,11 @@ struct MarkdownTextEditor: NSViewRepresentable {
             context.coordinator.currentTheme = editorTheme
             context.coordinator.currentFontPointSize = font.pointSize
             context.coordinator.currentFontName = font.fontName
-            context.coordinator.applyHighlightingNow()
+            // Debounced: a pinch gesture lands many font-size changes per
+            // second, and a full token re-highlight per tick made zooming
+            // chug. The base font applies instantly (textView.font above);
+            // styled runs catch up ~120ms after the gesture pauses.
+            context.coordinator.scheduleThemeRehighlight()
         }
     }
 
@@ -373,11 +461,24 @@ struct MarkdownTextEditor: NSViewRepresentable {
         textView.highlightCurrentLine = highlightCurrentLine
         textView.currentLineColor = NSColor(editorTheme.currentLineColor).withAlphaComponent(0.35)
         scrollView.backgroundColor = NSColor(editorTheme.backgroundColor)
+
+        // Base typing attributes: without these, text typed into an empty
+        // document (or an oversized one that skips highlighting) renders in
+        // the default black-on-white attributes until the next highlight pass.
+        let paragraphStyle = NSMutableParagraphStyle()
+        paragraphStyle.lineSpacing = 4
+        textView.typingAttributes = [
+            .font: font,
+            .foregroundColor: NSColor(editorTheme.textColor),
+            .paragraphStyle: paragraphStyle
+        ]
     }
 
     private func applyRulerTheme(_ ruler: LineNumberRulerView) {
         ruler.numberColor = NSColor(editorTheme.lineNumberColor)
+        ruler.emphasizedNumberColor = NSColor(editorTheme.textColor).withAlphaComponent(0.85)
         ruler.gutterColor = NSColor(editorTheme.backgroundColor)
+        ruler.editorFontSize = font.pointSize
     }
 
     func makeCoordinator() -> Coordinator {
@@ -458,6 +559,16 @@ struct MarkdownTextEditor: NSViewRepresentable {
 
         private func handleScrollChanged() {
             rulerView?.needsDisplay = true
+            // Keep the completion popup pinned to the caret instead of floating
+            // at a stale position while the document scrolls under it.
+            if completionPopup.isVisible, let textView {
+                let sel = textView.selectedRange()
+                let caretRect = textView.firstRect(
+                    forCharacterRange: NSRange(location: sel.location, length: 0),
+                    actualRange: nil
+                )
+                completionPopup.move(to: NSPoint(x: caretRect.minX, y: caretRect.minY - 4))
+            }
             postScrollFraction()
         }
 
@@ -500,7 +611,24 @@ struct MarkdownTextEditor: NSViewRepresentable {
             let length = (textView.string as NSString).length
             let location = min(lineIndex.startLocation(ofLine: lineNumber), length)
             let range = NSRange(location: location, length: 0)
-            textView.scrollRangeToVisible(range)
+            // Center the destination (Xcode/Safari find behavior) so the jump
+            // target has context around it instead of hugging the viewport edge.
+            if let layoutManager = textView.layoutManager,
+               let container = textView.textContainer,
+               let scrollView = textView.enclosingScrollView {
+                let glyphRange = layoutManager.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+                var lineRect = layoutManager.boundingRect(forGlyphRange: glyphRange, in: container)
+                lineRect.origin.y += textView.textContainerInset.height
+                let clip = scrollView.contentView
+                let targetY = min(
+                    max(0, lineRect.midY - clip.bounds.height / 2),
+                    max(0, textView.frame.height - clip.bounds.height)
+                )
+                clip.scroll(to: NSPoint(x: clip.bounds.origin.x, y: targetY))
+                scrollView.reflectScrolledClipView(clip)
+            } else {
+                textView.scrollRangeToVisible(range)
+            }
             textView.setSelectedRange(range)
             textView.window?.makeFirstResponder(textView)
         }
@@ -649,8 +777,16 @@ struct MarkdownTextEditor: NSViewRepresentable {
         func textViewDidChangeSelection(_ notification: Notification) {
             guard let textView = notification.object as? NSTextView else { return }
             reportSelection(of: textView)
-            // Repaint for the current-line highlight.
-            textView.needsDisplay = true
+            // Repaint for the current-line highlight — but only when the feature
+            // can actually draw something. Unconditional needsDisplay forced a
+            // full glyph redraw on every caret move and throughout drag-selection.
+            if let cmdTextView = textView as? CmdMDTextView,
+               cmdTextView.highlightCurrentLine,
+               cmdTextView.selectedRange().length == 0 {
+                cmdTextView.needsDisplay = true
+            }
+            // The gutter emphasizes the caret's line number.
+            rulerView?.needsDisplay = true
 
             if completionPopup.isVisible {
                 let sel = textView.selectedRange()
@@ -678,7 +814,24 @@ struct MarkdownTextEditor: NSViewRepresentable {
             highlighter.applyHighlights(to: storage, font: parent.font, theme: parent.editorTheme)
         }
 
+        /// Short-debounced re-highlight for theme/font (zoom) changes. Unlike
+        /// the typing path this must run even for oversized documents, because
+        /// their base attributes carry the changed font.
+        func scheduleThemeRehighlight() {
+            highlightDebounce?.cancel()
+            let workItem = DispatchWorkItem { [weak self] in
+                self?.applyHighlightingNow()
+            }
+            highlightDebounce = workItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: workItem)
+        }
+
         private func scheduleHighlighting(for textView: NSTextView) {
+            // Oversized documents skip token passes anyway, and their base
+            // attributes are already uniform — re-running the full-range reset
+            // per typing pause only invalidated layout for the whole file.
+            // Typed text inherits typingAttributes, so nothing goes stale.
+            guard (textView.textStorage?.length ?? 0) <= SyntaxHighlighter.highlightSizeLimit else { return }
             highlightDebounce?.cancel()
             let workItem = DispatchWorkItem { [weak self] in
                 self?.applyHighlightingNow()

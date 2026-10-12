@@ -44,6 +44,22 @@ final class RendererFeatureTests: XCTestCase {
         XCTAssertFalse(html.contains("<mark>"))
     }
 
+    func testManyInlineCodeTokensRestoreWithoutExtensionRewriting() {
+        let snippets = (0..<25).map { index in
+            "`#tag-\(index) [[Note \(index)]] ==mark-\(index)==`"
+        }
+        let html = render(snippets.joined(separator: " "))
+
+        for index in 0..<25 {
+            XCTAssertTrue(
+                html.contains("<code>#tag-\(index) [[Note \(index)]] ==mark-\(index)==</code>"),
+                "code token \(index) must be restored exactly"
+            )
+        }
+        XCTAssertFalse(html.contains("class=\"wiki-link\""))
+        XCTAssertFalse(html.contains("<mark>"))
+    }
+
     // MARK: Wiki links / tags toggle
 
     func testWikiLinksDisabledRendersPlainText() {
@@ -61,6 +77,16 @@ final class RendererFeatureTests: XCTestCase {
         XCTAssertTrue(html.contains("$a_b + c_d$"), "math must survive as literal text for in-DOM rendering")
         XCTAssertFalse(html.contains("<em>"), "underscores inside math must not become emphasis")
         XCTAssertTrue(html.contains("katex"), "KaTeX assets must be included when enabled")
+    }
+
+    func testManyMathTokensRestoreExactly() {
+        let expressions = (0..<15).map { "$a_\($0) + b_\($0)$" }
+        let html = render(expressions.joined(separator: " "), configure: { $0.enableKaTeX = true })
+
+        for expression in expressions {
+            XCTAssertTrue(html.contains(expression), "math token must be restored exactly: \(expression)")
+        }
+        XCTAssertFalse(html.contains("<em>"))
     }
 
     func testKaTeXDisabledHasNoKatexAssets() {

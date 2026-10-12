@@ -16,10 +16,14 @@ import SwiftUI
 
 struct OmnisearchView: View {
     @Environment(AppState.self) private var appState
-    @Environment(\.dismiss) private var dismiss
 
     @State private var model = OmnisearchModel()
     @State private var contentSearchTask: Task<Void, Never>?
+
+    /// Presented as an overlay, not a sheet — closing means clearing the flag.
+    private func dismiss() {
+        appState.showOmnisearch = false
+    }
 
     struct Hit: Identifiable {
         enum Kind {
@@ -163,9 +167,7 @@ struct OmnisearchView: View {
                     }
                     .onChange(of: model.selectedIndex) { _, newIndex in
                         guard model.navigatingByKeyboard else { return }
-                        withAnimation {
-                            proxy.scrollTo(newIndex, anchor: .center)
-                        }
+                        proxy.scrollTo(newIndex, anchor: nil)
                     }
                 }
             }
@@ -189,7 +191,11 @@ struct OmnisearchView: View {
         .tint(.cmdsAccent)
         .background(.regularMaterial)
         .clipShape(RoundedRectangle(cornerRadius: 12))
-        .shadow(color: .black.opacity(0.2), radius: 20, y: 10)
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.25), radius: 24, y: 12)
         .onDisappear {
             contentSearchTask?.cancel()
         }
