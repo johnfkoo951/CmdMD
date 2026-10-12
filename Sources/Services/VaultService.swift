@@ -76,6 +76,33 @@ actor VaultService {
         return url
     }
     
+    /// Where the vault's folder is now. Bookmarks follow renames and moves
+    /// (Obsidian's Rename vault, Finder, iCloud Drive), which the stored
+    /// rootPath doesn't. Comes with a re-minted bookmark when the stored one
+    /// is stale. Nil without a bookmark or when it doesn't resolve; never
+    /// mounts a volume or shows UI.
+    func resolveLocation(of vault: Vault) -> (url: URL, refreshedBookmark: Data?)? {
+        guard let bookmarkData = vault.bookmarkData ?? bookmarks[vault.id] else { return nil }
+
+        var isStale = false
+        guard let url = try? URL(
+            resolvingBookmarkData: bookmarkData,
+            options: [.withSecurityScope, .withoutUI, .withoutMounting],
+            relativeTo: nil,
+            bookmarkDataIsStale: &isStale
+        ) else { return nil }
+        guard isStale else { return (url, nil) }
+
+        let accessing = url.startAccessingSecurityScopedResource()
+        defer { if accessing { url.stopAccessingSecurityScopedResource() } }
+        let refreshed = try? url.bookmarkData(
+            options: [.withSecurityScope],
+            includingResourceValuesForKeys: nil,
+            relativeTo: nil
+        )
+        return (url, refreshed)
+    }
+
     func releaseVaultAccess(for vault: Vault) {
         if let url = accessedURLs[vault.id] {
             url.stopAccessingSecurityScopedResource()
@@ -105,9 +132,23 @@ actor VaultService {
             }
         }
         
-        return folders.sorted()
+        return folders.sorted(by: Self.folderPathPrecedes)
     }
     
+    /// Folder-tree order for the nested pickers, which indent by depth and
+    /// show only the last component: paths compare component by component in
+    /// Finder order (case-insensitive, numeric-aware), so each folder's
+    /// subfolders follow it directly. Plain `<` put "Daily Notes" between
+    /// "Daily" and "Daily/2026", whose "2026" then read as a Daily Notes child.
+    static func folderPathPrecedes(_ a: String, _ b: String) -> Bool {
+        let lhs = a.split(separator: "/"), rhs = b.split(separator: "/")
+        for (l, r) in zip(lhs, rhs) where l != r {
+            let order = l.localizedStandardCompare(r)
+            return order == .orderedSame ? l < r : order == .orderedAscending
+        }
+        return lhs.count < rhs.count
+    }
+
 
     
     /// Counts Markdown notes in a vault (best-effort, skips hidden + `.obsidian`).
@@ -139,7 +180,9 @@ actor VaultService {
         }
         
         if let data = try? JSONEncoder().encode(dict) {
-            try? data.write(to: bookmarksURL)
+            // Atomic, like the other data files: an interrupted write must not
+            // leave a truncated file that drops every bookmark on next read.
+            try? data.write(to: bookmarksURL, options: .atomic)
         }
     }
 }
@@ -198,19 +241,32 @@ enum ObsidianLocator {
     }
 }
 
-struct VaultNote: Codable, Identifiable {
+/// In-memory index entry (never persisted).
+struct VaultNote: Identifiable {
     var id: String { path }
     let path: String
     let title: String
     let modifiedAt: Date
     /// Absolute location, used by Omnisearch to open the file directly.
     let url: URL
+    /// `searchKey(for:)` of title and path, built once with the index (off the
+    /// main thread) so per-keystroke completion matching is a plain byte search.
+    let titleKey: [UInt8]
+    let pathKey: [UInt8]
 
     init(path: String, title: String, modifiedAt: Date, url: URL? = nil) {
         self.path = path
         self.title = title
         self.modifiedAt = modifiedAt
         self.url = url ?? URL(fileURLWithPath: path, isDirectory: false)
+        self.titleKey = Self.searchKey(for: title)
+        self.pathKey = Self.searchKey(for: path)
+    }
+
+    /// Case-insensitive match key: precomposed (NFC — the file system often
+    /// hands back decomposed names, e.g. Korean), lowercased, as UTF-8 bytes.
+    static func searchKey(for string: String) -> [UInt8] {
+        Array(string.precomposedStringWithCanonicalMapping.lowercased().utf8)
     }
 }
 

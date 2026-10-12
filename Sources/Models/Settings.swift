@@ -33,25 +33,26 @@ struct PreviewSettings: Codable, Equatable {
 
     init() {}
 
-    // Resilient decoding: any missing key falls back to its default instead of
-    // failing the whole decode (which silently reset every setting whenever a
-    // field was added or removed between app versions).
+    // Resilient decoding: any missing — or present but unreadable — key falls
+    // back to its default instead of failing the whole decode (which silently
+    // reset every setting whenever a field was added, removed or retyped
+    // between app versions).
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let d = PreviewSettings()
-        lineHeight = try c.decodeIfPresent(CGFloat.self, forKey: .lineHeight) ?? d.lineHeight
-        headingScale = try c.decodeIfPresent(CGFloat.self, forKey: .headingScale) ?? d.headingScale
-        headingColor = try c.decodeIfPresent(String.self, forKey: .headingColor) ?? d.headingColor
-        headingMarginTop = try c.decodeIfPresent(CGFloat.self, forKey: .headingMarginTop) ?? d.headingMarginTop
-        headingMarginBottom = try c.decodeIfPresent(CGFloat.self, forKey: .headingMarginBottom) ?? d.headingMarginBottom
-        codeBlockTheme = try c.decodeIfPresent(String.self, forKey: .codeBlockTheme) ?? d.codeBlockTheme
-        customCSS = try c.decodeIfPresent(String.self, forKey: .customCSS) ?? d.customCSS
-        maxWidth = try c.decodeIfPresent(CGFloat.self, forKey: .maxWidth) ?? d.maxWidth
-        fontFamily = try c.decodeIfPresent(String.self, forKey: .fontFamily) ?? d.fontFamily
-        fontSize = try c.decodeIfPresent(CGFloat.self, forKey: .fontSize) ?? d.fontSize
-        letterSpacing = try c.decodeIfPresent(CGFloat.self, forKey: .letterSpacing) ?? d.letterSpacing
-        wordSpacing = try c.decodeIfPresent(CGFloat.self, forKey: .wordSpacing) ?? d.wordSpacing
-        charWidth = try c.decodeIfPresent(CGFloat.self, forKey: .charWidth) ?? d.charWidth
+        lineHeight = (try? c.decodeIfPresent(CGFloat.self, forKey: .lineHeight)) ?? d.lineHeight
+        headingScale = (try? c.decodeIfPresent(CGFloat.self, forKey: .headingScale)) ?? d.headingScale
+        headingColor = (try? c.decodeIfPresent(String.self, forKey: .headingColor)) ?? d.headingColor
+        headingMarginTop = (try? c.decodeIfPresent(CGFloat.self, forKey: .headingMarginTop)) ?? d.headingMarginTop
+        headingMarginBottom = (try? c.decodeIfPresent(CGFloat.self, forKey: .headingMarginBottom)) ?? d.headingMarginBottom
+        codeBlockTheme = (try? c.decodeIfPresent(String.self, forKey: .codeBlockTheme)) ?? d.codeBlockTheme
+        customCSS = (try? c.decodeIfPresent(String.self, forKey: .customCSS)) ?? d.customCSS
+        maxWidth = (try? c.decodeIfPresent(CGFloat.self, forKey: .maxWidth)) ?? d.maxWidth
+        fontFamily = (try? c.decodeIfPresent(String.self, forKey: .fontFamily)) ?? d.fontFamily
+        fontSize = (try? c.decodeIfPresent(CGFloat.self, forKey: .fontSize)) ?? d.fontSize
+        letterSpacing = (try? c.decodeIfPresent(CGFloat.self, forKey: .letterSpacing)) ?? d.letterSpacing
+        wordSpacing = (try? c.decodeIfPresent(CGFloat.self, forKey: .wordSpacing)) ?? d.wordSpacing
+        charWidth = (try? c.decodeIfPresent(CGFloat.self, forKey: .charWidth)) ?? d.charWidth
     }
 }
 
@@ -125,44 +126,73 @@ struct AppSettings: Codable, Equatable {
 
     init() {}
 
+    // Per-field fallback as in PreviewSettings: one unreadable value — say an
+    // editor theme from a newer build — resets only itself. Enum raw values
+    // are what's persisted, so renaming one is a format change.
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let d = AppSettings()
-        theme = try c.decodeIfPresent(AppTheme.self, forKey: .theme) ?? d.theme
-        editorTheme = try c.decodeIfPresent(EditorTheme.self, forKey: .editorTheme) ?? d.editorTheme
-        autosaveEnabled = try c.decodeIfPresent(Bool.self, forKey: .autosaveEnabled) ?? d.autosaveEnabled
-        autosaveInterval = try c.decodeIfPresent(TimeInterval.self, forKey: .autosaveInterval) ?? d.autosaveInterval
-        showLineNumbers = try c.decodeIfPresent(Bool.self, forKey: .showLineNumbers) ?? d.showLineNumbers
-        softWrap = try c.decodeIfPresent(Bool.self, forKey: .softWrap) ?? d.softWrap
-        fontSize = try c.decodeIfPresent(CGFloat.self, forKey: .fontSize) ?? d.fontSize
-        fontName = try c.decodeIfPresent(String.self, forKey: .fontName) ?? d.fontName
-        tabSize = try c.decodeIfPresent(Int.self, forKey: .tabSize) ?? d.tabSize
-        insertSpacesInsteadOfTabs = try c.decodeIfPresent(Bool.self, forKey: .insertSpacesInsteadOfTabs) ?? d.insertSpacesInsteadOfTabs
-        highlightCurrentLine = try c.decodeIfPresent(Bool.self, forKey: .highlightCurrentLine) ?? d.highlightCurrentLine
-        enableAutocompletion = try c.decodeIfPresent(Bool.self, forKey: .enableAutocompletion) ?? d.enableAutocompletion
-        copySelectionOnDrag = try c.decodeIfPresent(Bool.self, forKey: .copySelectionOnDrag) ?? d.copySelectionOnDrag
-        zoomLevel = try c.decodeIfPresent(Double.self, forKey: .zoomLevel) ?? d.zoomLevel
-        fileLoggingEnabled = try c.decodeIfPresent(Bool.self, forKey: .fileLoggingEnabled) ?? d.fileLoggingEnabled
-        previewTheme = try c.decodeIfPresent(String.self, forKey: .previewTheme) ?? d.previewTheme
-        previewSettings = try c.decodeIfPresent(PreviewSettings.self, forKey: .previewSettings) ?? d.previewSettings
-        enableWikiLinks = try c.decodeIfPresent(Bool.self, forKey: .enableWikiLinks) ?? d.enableWikiLinks
-        enableCallouts = try c.decodeIfPresent(Bool.self, forKey: .enableCallouts) ?? d.enableCallouts
-        enableMermaid = try c.decodeIfPresent(Bool.self, forKey: .enableMermaid) ?? d.enableMermaid
-        enableKaTeX = try c.decodeIfPresent(Bool.self, forKey: .enableKaTeX) ?? d.enableKaTeX
-        enablePreviewCodeHighlight = try c.decodeIfPresent(Bool.self, forKey: .enablePreviewCodeHighlight) ?? d.enablePreviewCodeHighlight
-        defaultVaultId = try c.decodeIfPresent(UUID.self, forKey: .defaultVaultId) ?? d.defaultVaultId
-        defaultSendFolder = try c.decodeIfPresent(String.self, forKey: .defaultSendFolder) ?? d.defaultSendFolder
-        conflictResolution = try c.decodeIfPresent(FileConflictResolution.self, forKey: .conflictResolution) ?? d.conflictResolution
-        injectFrontmatterByDefault = try c.decodeIfPresent(Bool.self, forKey: .injectFrontmatterByDefault) ?? d.injectFrontmatterByDefault
-        showStatusBar = try c.decodeIfPresent(Bool.self, forKey: .showStatusBar) ?? d.showStatusBar
-        showTabBar = try c.decodeIfPresent(Bool.self, forKey: .showTabBar) ?? d.showTabBar
-        sidebarWidth = try c.decodeIfPresent(CGFloat.self, forKey: .sidebarWidth) ?? d.sidebarWidth
-        restoreLastSession = try c.decodeIfPresent(Bool.self, forKey: .restoreLastSession) ?? d.restoreLastSession
-        confirmBeforeClosingDirtyTabs = try c.decodeIfPresent(Bool.self, forKey: .confirmBeforeClosingDirtyTabs) ?? d.confirmBeforeClosingDirtyTabs
-        scrollSyncEnabled = try c.decodeIfPresent(Bool.self, forKey: .scrollSyncEnabled) ?? d.scrollSyncEnabled
-        hasCompletedOnboarding = try c.decodeIfPresent(Bool.self, forKey: .hasCompletedOnboarding) ?? d.hasCompletedOnboarding
-        defaultWindowWidth = try c.decodeIfPresent(CGFloat.self, forKey: .defaultWindowWidth) ?? d.defaultWindowWidth
-        defaultWindowHeight = try c.decodeIfPresent(CGFloat.self, forKey: .defaultWindowHeight) ?? d.defaultWindowHeight
-        keyBindings = try c.decodeIfPresent([String: KeyBinding].self, forKey: .keyBindings) ?? d.keyBindings
+        theme = (try? c.decodeIfPresent(AppTheme.self, forKey: .theme)) ?? d.theme
+        editorTheme = (try? c.decodeIfPresent(EditorTheme.self, forKey: .editorTheme)) ?? d.editorTheme
+        // The palette once offered the hidden auto-variant; CMDS resolves to
+        // it in light mode anyway, and the Settings picker can show only CMDS.
+        if editorTheme == .cmdsLight { editorTheme = .cmds }
+        autosaveEnabled = (try? c.decodeIfPresent(Bool.self, forKey: .autosaveEnabled)) ?? d.autosaveEnabled
+        autosaveInterval = (try? c.decodeIfPresent(TimeInterval.self, forKey: .autosaveInterval)) ?? d.autosaveInterval
+        showLineNumbers = (try? c.decodeIfPresent(Bool.self, forKey: .showLineNumbers)) ?? d.showLineNumbers
+        softWrap = (try? c.decodeIfPresent(Bool.self, forKey: .softWrap)) ?? d.softWrap
+        fontSize = (try? c.decodeIfPresent(CGFloat.self, forKey: .fontSize)) ?? d.fontSize
+        fontName = (try? c.decodeIfPresent(String.self, forKey: .fontName)) ?? d.fontName
+        tabSize = (try? c.decodeIfPresent(Int.self, forKey: .tabSize)) ?? d.tabSize
+        insertSpacesInsteadOfTabs = (try? c.decodeIfPresent(Bool.self, forKey: .insertSpacesInsteadOfTabs)) ?? d.insertSpacesInsteadOfTabs
+        highlightCurrentLine = (try? c.decodeIfPresent(Bool.self, forKey: .highlightCurrentLine)) ?? d.highlightCurrentLine
+        enableAutocompletion = (try? c.decodeIfPresent(Bool.self, forKey: .enableAutocompletion)) ?? d.enableAutocompletion
+        copySelectionOnDrag = (try? c.decodeIfPresent(Bool.self, forKey: .copySelectionOnDrag)) ?? d.copySelectionOnDrag
+        zoomLevel = (try? c.decodeIfPresent(Double.self, forKey: .zoomLevel)) ?? d.zoomLevel
+        fileLoggingEnabled = (try? c.decodeIfPresent(Bool.self, forKey: .fileLoggingEnabled)) ?? d.fileLoggingEnabled
+        previewTheme = (try? c.decodeIfPresent(String.self, forKey: .previewTheme)) ?? d.previewTheme
+        previewSettings = (try? c.decodeIfPresent(PreviewSettings.self, forKey: .previewSettings)) ?? d.previewSettings
+        enableWikiLinks = (try? c.decodeIfPresent(Bool.self, forKey: .enableWikiLinks)) ?? d.enableWikiLinks
+        enableCallouts = (try? c.decodeIfPresent(Bool.self, forKey: .enableCallouts)) ?? d.enableCallouts
+        enableMermaid = (try? c.decodeIfPresent(Bool.self, forKey: .enableMermaid)) ?? d.enableMermaid
+        enableKaTeX = (try? c.decodeIfPresent(Bool.self, forKey: .enableKaTeX)) ?? d.enableKaTeX
+        enablePreviewCodeHighlight = (try? c.decodeIfPresent(Bool.self, forKey: .enablePreviewCodeHighlight)) ?? d.enablePreviewCodeHighlight
+        defaultVaultId = (try? c.decodeIfPresent(UUID.self, forKey: .defaultVaultId)) ?? d.defaultVaultId
+        defaultSendFolder = (try? c.decodeIfPresent(String.self, forKey: .defaultSendFolder)) ?? d.defaultSendFolder
+        conflictResolution = (try? c.decodeIfPresent(FileConflictResolution.self, forKey: .conflictResolution)) ?? d.conflictResolution
+        injectFrontmatterByDefault = (try? c.decodeIfPresent(Bool.self, forKey: .injectFrontmatterByDefault)) ?? d.injectFrontmatterByDefault
+        showStatusBar = (try? c.decodeIfPresent(Bool.self, forKey: .showStatusBar)) ?? d.showStatusBar
+        showTabBar = (try? c.decodeIfPresent(Bool.self, forKey: .showTabBar)) ?? d.showTabBar
+        sidebarWidth = (try? c.decodeIfPresent(CGFloat.self, forKey: .sidebarWidth)) ?? d.sidebarWidth
+        restoreLastSession = (try? c.decodeIfPresent(Bool.self, forKey: .restoreLastSession)) ?? d.restoreLastSession
+        confirmBeforeClosingDirtyTabs = (try? c.decodeIfPresent(Bool.self, forKey: .confirmBeforeClosingDirtyTabs)) ?? d.confirmBeforeClosingDirtyTabs
+        scrollSyncEnabled = (try? c.decodeIfPresent(Bool.self, forKey: .scrollSyncEnabled)) ?? d.scrollSyncEnabled
+        hasCompletedOnboarding = (try? c.decodeIfPresent(Bool.self, forKey: .hasCompletedOnboarding)) ?? d.hasCompletedOnboarding
+        defaultWindowWidth = (try? c.decodeIfPresent(CGFloat.self, forKey: .defaultWindowWidth)) ?? d.defaultWindowWidth
+        defaultWindowHeight = (try? c.decodeIfPresent(CGFloat.self, forKey: .defaultWindowHeight)) ?? d.defaultWindowHeight
+        // Entry by entry: an unreadable binding falls back to its default alone.
+        keyBindings = (try? c.decodeIfPresent(LossyDictionary<KeyBinding>.self, forKey: .keyBindings))?.elements ?? d.keyBindings
+    }
+}
+
+/// Decodes a JSON object entry by entry, skipping values that fail — the
+/// keyed counterpart of `LossyList`.
+private struct LossyDictionary<Value: Decodable>: Decodable {
+    var elements: [String: Value] = [:]
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: Key.self)
+        for key in container.allKeys {
+            if let value = try? container.decode(Value.self, forKey: key) {
+                elements[key.stringValue] = value
+            }
+        }
+    }
+
+    private struct Key: CodingKey {
+        let stringValue: String
+        var intValue: Int? { nil }
+        init(stringValue: String) { self.stringValue = stringValue }
+        init?(intValue: Int) { nil }
     }
 }

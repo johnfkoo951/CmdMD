@@ -1,4 +1,5 @@
 import SwiftUI
+import WebKit
 
 struct ContentView: View {
     @Environment(AppState.self) private var appState
@@ -34,11 +35,21 @@ struct ContentView: View {
         .preferredColorScheme(effectiveColorScheme)
         .tint(.cmdsAccent)
         .background(WindowAccessor(window: $hostWindow))
+        .onChange(of: hostWindow) { _, window in
+            // ⌘W and the Quick Capture hot key need to know which window
+            // is the editor.
+            AppWindowPolicy.editorWindow = window
+        }
+        .onDisappear {
+            // The window closed; CmdMD keeps running in the menu bar. A sheet
+            // or overlay still flagged must not pop up when it reopens.
+            appState.dismissTransientPresentations()
+        }
         .onChange(of: appState.settings.defaultWindowWidth) { _, w in
-            hostWindow?.setContentSize(NSSize(width: w, height: appState.settings.defaultWindowHeight))
+            resizeHostWindow(width: w)
         }
         .onChange(of: appState.settings.defaultWindowHeight) { _, h in
-            hostWindow?.setContentSize(NSSize(width: appState.settings.defaultWindowWidth, height: h))
+            resizeHostWindow(height: h)
         }
         .onChange(of: appState.activeTab?.isDirty == true) { _, dirty in
             // Native "edited" dot inside the window close button.
@@ -60,11 +71,12 @@ struct ContentView: View {
                     // menu and VoiceOver meaningful.
                     Label("Inspector", systemImage: "sidebar.right")
                 }
-                .help("Show or hide the Inspector (\(appState.keyBinding(for: .toggleInspector).displayString))")
+                .help(appState.shortcutHelp("Show or hide the Inspector", .toggleInspector))
             }
         }
         .sheet(isPresented: $state.showSendToVault, onDismiss: {
             appState.batchSendURLs = []
+            appState.batchSendRoot = nil
         }) {
             SendToVaultSheet()
         }
@@ -103,17 +115,48 @@ struct ContentView: View {
             // ⌘P / ⇧⌘O as centered floating panels (Spotlight / Xcode Open
             // Quickly idiom) — the previous window sheets slid down from the
             // title bar with double chrome and felt slow to invoke.
-            PaletteOverlay()
+            PaletteOverlay(window: hostWindow)
         }
         .overlay {
             if let toast = appState.toastMessage {
-                ToastView(message: toast)
+                ToastView(message: toast, style: appState.toastStyle)
                     .transition(.move(edge: .top).combined(with: .opacity))
                     .allowsHitTesting(false)
             }
         }
         .animation(.easeInOut(duration: 0.2), value: appState.toastMessage)
         .focusedSceneValue(\.document, appState.currentDocument)
+    }
+
+    /// Applies a Window-size setting to this window. Only the dimension that
+    /// changed moves (the other used to snap back to its stored value), the
+    /// top edge stays put, and the frame stays on screen: the width slider
+    /// goes to 2000 px, wider than many displays.
+    private func resizeHostWindow(width: CGFloat? = nil, height: CGFloat? = nil) {
+        guard let window = hostWindow, !window.styleMask.contains(.fullScreen) else { return }
+        let content = window.contentRect(forFrameRect: window.frame)
+        var frame = window.frameRect(forContentRect: NSRect(
+            x: content.minX, y: content.minY,
+            width: width ?? content.width, height: height ?? content.height
+        ))
+        frame.origin.y = window.frame.maxY - frame.height
+        if let visible = (window.screen ?? NSScreen.main)?.visibleFrame {
+            frame = WindowFrameClamp.clamped(frame, to: visible)
+        }
+        window.setFrame(frame, display: true)
+    }
+}
+
+/// Keeps a window frame inside the screen's visible area.
+enum WindowFrameClamp {
+    /// Shrinks `frame` to fit `visible`, keeping its top edge where it can,
+    /// then shifts it back inside.
+    static func clamped(_ frame: CGRect, to visible: CGRect) -> CGRect {
+        let width = min(frame.width, visible.width)
+        let height = min(frame.height, visible.height)
+        let x = min(max(frame.minX, visible.minX), visible.maxX - width)
+        let y = min(max(frame.maxY - height, visible.minY), visible.maxY - height)
+        return CGRect(x: x, y: y, width: width, height: height)
     }
 }
 
@@ -137,6 +180,11 @@ struct DocumentProxyIcon: ViewModifier {
 struct PaletteOverlay: View {
     @Environment(AppState.self) private var appState
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// The window the overlay covers. Its search field takes this window's
+    /// first responder (the old sheets had their own window), so closing
+    /// must hand focus back.
+    var window: NSWindow?
+    @State private var focusToRestore = PaletteFocus.Memory()
 
     private var isPresented: Bool {
         appState.showCommandPalette || appState.showOmnisearch
@@ -166,9 +214,78 @@ struct PaletteOverlay: View {
                 }
                 .padding(.top, 110)
                 .transition(.scale(scale: 0.97, anchor: .top).combined(with: .opacity))
+                // Keeps VoiceOver inside the panel instead of the window behind.
+                .accessibilityAddTraits(.isModal)
             }
         }
         .animation(reduceMotion ? nil : .snappy(duration: 0.18), value: isPresented)
+        .onChange(of: isPresented) { _, presented in
+            if presented {
+                // Runs before the search field's async focus grab.
+                focusToRestore.view = PaletteFocus.restorableView(for: window?.firstResponder)
+            } else {
+                // Next turn: the field is gone and the chosen command has run
+                // (it may have switched the view mode or opened a note).
+                DispatchQueue.main.async { restoreFocus() }
+            }
+        }
+    }
+
+    private func restoreFocus() {
+        // The palette may have handed over to Omnisearch in the meantime.
+        guard !isPresented, let window else { return }
+        let view = focusToRestore.view
+        focusToRestore.view = nil
+        guard let view, view.window === window,
+              PaletteFocus.shouldRestore(
+                isEditor: view is CmdMDTextView,
+                isPreview: PaletteFocus.isInWebView(view),
+                mode: appState.viewMode
+              ) else {
+            // Nothing to go back to: the pane on screen takes focus (unless
+            // the command put it somewhere), so ↓ / Space scroll the note.
+            PaneFocus.post(mode: appState.viewMode, modeChanged: false)
+            return
+        }
+        window.makeFirstResponder(view)
+    }
+}
+
+/// Where keyboard focus returns when the palette overlay closes. Without it
+/// the window itself kept first responder, so typing beeped until a click.
+enum PaletteFocus {
+    final class Memory {
+        weak var view: NSView?
+    }
+
+    /// The view to refocus: the text field itself while one is being edited
+    /// (the shared field editor moves on to the palette's field), and never
+    /// the palette's own field.
+    static func restorableView(for responder: NSResponder?) -> NSView? {
+        let view: NSView?
+        if let fieldEditor = responder as? NSTextView, fieldEditor.isFieldEditor {
+            view = fieldEditor.delegate as? NSView
+        } else {
+            view = responder as? NSView
+        }
+        return view is AutoFocusTextField ? nil : view
+    }
+
+    /// Never back into a pane the current mode hides: the editor stays mounted
+    /// in Preview, and typing into it would edit the note invisibly.
+    static func shouldRestore(isEditor: Bool, isPreview: Bool, mode: ViewMode) -> Bool {
+        if isEditor { return mode != .preview }
+        if isPreview { return mode != .source }
+        return true
+    }
+
+    static func isInWebView(_ view: NSView) -> Bool {
+        var current: NSView? = view
+        while let candidate = current {
+            if candidate is WKWebView { return true }
+            current = candidate.superview
+        }
+        return false
     }
 }
 
@@ -190,7 +307,7 @@ struct ViewModePicker: View {
         .labelStyle(.iconOnly)
         .controlSize(.regular)
         .fixedSize()
-        .help("Source ⌘1 · Split ⌘2 · Preview ⌘3")
+        .help("\(appState.shortcutHelp("Source", .sourceMode)) · \(appState.shortcutHelp("Split", .splitMode)) · \(appState.shortcutHelp("Preview", .previewMode))")
     }
 }
 
@@ -213,7 +330,11 @@ struct SendToVaultButton: View {
                             options.targetFolder = appState.effectiveSendFolder(for: vault)
                             options.conflictResolution = appState.settings.conflictResolution
                             options.injectFrontmatter = appState.settings.injectFrontmatterByDefault
-                            try? await appState.sendToVault(options: options)
+                            do {
+                                try await appState.sendToVault(options: options)
+                            } catch {
+                                appState.errorMessage = "Send to \(vault.displayName) failed: \(error.localizedDescription)"
+                            }
                         }
                     } label: {
                         Label("\(vault.displayName) / \(appState.effectiveSendFolder(for: vault))", systemImage: "tray.and.arrow.down")
@@ -222,35 +343,60 @@ struct SendToVaultButton: View {
 
                 Divider()
 
+                // The same remappable bindings as the Vault menu.
                 Button("Send with Options…") {
                     appState.showSendToVault = true
                 }
-                .keyboardShortcut("t", modifiers: [.command, .shift])
+                .appShortcut(appState.keyBinding(for: .sendToVault))
 
                 Button("Auto-Route") {
                     appState.autoRouteCurrentDocument()
                 }
-                .keyboardShortcut("t", modifiers: [.command, .control])
+                .appShortcut(appState.keyBinding(for: .autoRoute))
             }
         } label: {
             Image(systemName: "paperplane")
         }
         .disabled(appState.currentDocument == nil)
-        .help("Send to Vault (⇧⌘T)")
+        .help(appState.shortcutHelp("Send to Vault", .sendToVault))
+    }
+}
+
+/// How a toast reads at a glance. Every toast used to carry a green
+/// checkmark, failures included.
+enum ToastStyle {
+    case success, warning, error
+
+    var symbol: String {
+        switch self {
+        case .success: return "checkmark.circle.fill"
+        case .warning: return "exclamationmark.triangle.fill"
+        case .error: return "xmark.octagon.fill"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .success: return .green
+        case .warning: return .orange
+        case .error: return .red
+        }
     }
 }
 
 struct ToastView: View {
     let message: String
-    
+    var style: ToastStyle = .success
+
     var body: some View {
         VStack {
             HStack(spacing: 8) {
-                Image(systemName: "checkmark.circle.fill")
-                    .foregroundStyle(.green)
+                Image(systemName: style.symbol)
+                    .foregroundStyle(style.color)
                 Text(message)
                     .font(.system(size: 13, weight: .medium))
             }
+            .accessibilityElement(children: .combine)
             .padding(.horizontal, 16)
             .padding(.vertical, 10)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
@@ -266,6 +412,18 @@ extension AppState {
     var sidebarColumnVisibility: NavigationSplitViewVisibility {
         get { sidebarVisible ? .all : .detailOnly }
         set { sidebarVisible = newValue != .detailOnly }
+    }
+
+    /// Clears the sheets and overlays the editor window presents, for when
+    /// that window closes. Onboarding is left alone: it isn't done yet.
+    func dismissTransientPresentations() {
+        showCommandPalette = false
+        showOmnisearch = false
+        showSendToVault = false
+        showVaultManager = false
+        showQuickCapture = false
+        showAbout = false
+        batchSendURLs = []
     }
 }
 
@@ -285,7 +443,7 @@ struct OnboardingView: View {
                 VStack(spacing: 4) {
                     Text("Welcome to CmdMD")
                         .font(.title2.bold())
-                    Text("리뷰 우선 마크다운 에디터 · Obsidian 볼트 라우터")
+                    Text("A review-first Markdown editor & Obsidian vault router")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
@@ -305,7 +463,7 @@ struct OnboardingView: View {
                     }
                 }
 
-                Text("CMDS 테마가 기본으로 적용됩니다. 세부 설정은 언제든 설정에서 바꿀 수 있어요.")
+                Text("The CMDS theme is applied by default. You can change any of this later in Settings.")
                     .font(.caption)
                     .foregroundStyle(.tertiary)
             }
@@ -317,11 +475,13 @@ struct OnboardingView: View {
                 appState.settings.hasCompletedOnboarding = true
                 appState.saveUserData()
             } label: {
-                Text("시작하기")
+                Text("Get Started")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
+            // Return completes the only step of a sheet that can't be dismissed.
+            .keyboardShortcut(.defaultAction)
         }
         .padding(28)
         .frame(width: 460)
@@ -388,8 +548,17 @@ struct WindowAccessor: NSViewRepresentable {
 // MARK: - About / creator info
 
 enum AppInfo {
-    static var version: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.4.2"
+    static var version: String { version(from: Bundle.main.infoDictionary) }
+    /// False for `swift build` / `swift run` binaries: SwiftPM embeds no Info.plist
+    /// (scripts/package_app.sh writes the app's, from VERSION), so there is no
+    /// release version to report or to compare with the latest release.
+    static var isPackagedBuild: Bool { isPackaged(info: Bundle.main.infoDictionary) }
+
+    static func version(from info: [String: Any]?) -> String {
+        info?["CFBundleShortVersionString"] as? String ?? "dev"
+    }
+    static func isPackaged(info: [String: Any]?) -> Bool {
+        info?["CFBundleShortVersionString"] is String
     }
     static var build: String {
         Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? ""

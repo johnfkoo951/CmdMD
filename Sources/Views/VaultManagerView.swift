@@ -66,16 +66,18 @@ struct VaultManagerView: View {
 
 struct VaultsManagerPane: View {
     @Environment(AppState.self) private var appState
-    @State private var selectedVault: Vault?
+    /// By id: a whole-Vault selection stopped matching its row (and the
+    /// detail showed a stale copy) as soon as the vault was edited.
+    @State private var selectedVaultID: Vault.ID?
     @State private var isAddingVault = false
 
     var body: some View {
         HSplitView {
             VStack(spacing: 0) {
-                List(selection: $selectedVault) {
+                List(selection: $selectedVaultID) {
                     ForEach(appState.vaults) { vault in
                         VaultListRow(vault: vault)
-                            .tag(vault)
+                            .tag(vault.id)
                     }
                 }
                 .listStyle(.inset)
@@ -98,7 +100,7 @@ struct VaultsManagerPane: View {
             .frame(minWidth: 200, maxWidth: 260)
 
             Group {
-                if let vault = selectedVault, appState.vaults.contains(where: { $0.id == vault.id }) {
+                if let id = selectedVaultID, let vault = appState.vaults.first(where: { $0.id == id }) {
                     VaultDetailView(vault: vault)
                 } else {
                     ContentUnavailableView(
@@ -110,6 +112,8 @@ struct VaultsManagerPane: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+        // Show renamed or moved vaults where they are now.
+        .task { await appState.reconcileVaultLocations() }
         .sheet(isPresented: $isAddingVault) {
             AddVaultSheet()
         }
@@ -151,6 +155,10 @@ struct VaultDetailView: View {
     @State private var availableFolders: [String] = []
     @State private var noteCount: Int?
     @State private var confirmingDisconnect = false
+    @State private var locationError: String?
+    /// The vault whose folders and count are loading; a slower load for a
+    /// previously selected vault is dropped instead of overwriting them.
+    @State private var loadingVaultId: UUID?
 
     private var isObsidianVault: Bool {
         ObsidianLocator.isObsidianVault(vault.rootPath)
@@ -195,12 +203,22 @@ struct VaultDetailView: View {
                 TextField("Name", text: $editedName)
 
                 LabeledContent("Path") {
-                    Text(vault.rootPath.path)
+                    HStack(spacing: 6) {
+                        Text(vault.rootPath.path)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Button("Change…") { changeFolder() }
+                            .help("Point this vault at its folder's new location, keeping its rules and settings")
+                    }
+                }
+
+                if let message = locationError ?? (vault.folderExists ? nil : "Folder not found. If it was moved or renamed, use Change… to locate it.") {
+                    Label(message, systemImage: "exclamationmark.triangle")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
+                        .foregroundStyle(.red)
                 }
 
                 Toggle("Default Vault", isOn: $isDefault)
@@ -278,6 +296,7 @@ struct VaultDetailView: View {
         .formStyle(.grouped)
         .onAppear { reload() }
         .onChange(of: vault.id) { _, _ in reload() }
+        .onChange(of: vault.rootPath) { _, _ in reload() }
         .onChange(of: editedName) { _, _ in saveChanges() }
         .onChange(of: editedInboxPath) { _, _ in saveChanges() }
     }
@@ -292,11 +311,43 @@ struct VaultDetailView: View {
         editedInboxPath = vault.inboxPath
         isDefault = appState.settings.defaultVaultId == vault.id
         noteCount = nil
+        locationError = nil
         loadFoldersAndStats()
     }
 
+    /// Repoints the vault in place, for a folder its bookmark can't follow
+    /// (moved to another drive, or the old path recreated meanwhile).
+    private func changeFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = vault.rootPath.deletingLastPathComponent()
+        panel.message = "Select the folder of \u{201C}\(vault.displayName)\u{201D}"
+        panel.prompt = "Select"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        if let other = appState.vaults.first(where: { $0.id != vault.id && $0.hasRoot(url) }) {
+            locationError = "Already connected as \u{201C}\(other.displayName)\u{201D}."
+            return
+        }
+        guard let bookmarkData = try? url.bookmarkData(
+            options: [.withSecurityScope],
+            includingResourceValuesForKeys: nil,
+            relativeTo: nil
+        ) else {
+            locationError = VaultError.accessDenied.localizedDescription
+            return
+        }
+        locationError = nil
+        // The rootPath change reloads the fields, folders and note count.
+        appState.relocateVault(id: vault.id, to: url, bookmarkData: bookmarkData)
+    }
+
     private func loadFoldersAndStats() {
-        let vaultService = VaultService(dataDirectory: FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!.appendingPathComponent("CmdMD"))
+        let vaultService = VaultService(dataDirectory: AppState.dataDirectory)
+        let requested = vault.id
+        loadingVaultId = requested
         Task {
             var folders = (try? await vaultService.listFolders(in: vault)) ?? []
             if !vault.inboxPath.isEmpty, !folders.contains(vault.inboxPath) {
@@ -304,6 +355,7 @@ struct VaultDetailView: View {
             }
             let count = await vaultService.noteCount(in: vault)
             await MainActor.run {
+                guard loadingVaultId == requested else { return }
                 availableFolders = folders
                 noteCount = count
             }
@@ -316,7 +368,8 @@ struct VaultDetailView: View {
             updated.name = editedName
             updated.inboxPath = editedInboxPath
             appState.vaults[index] = updated
-            appState.saveUserData()
+            // Debounced: this runs per keystroke in the name/inbox fields.
+            appState.saveUserDataDebounced()
         }
     }
 }
@@ -326,6 +379,8 @@ struct VaultDetailView: View {
 struct TemplatesManagerPane: View {
     @Environment(AppState.self) private var appState
     @State private var editingTemplate: VaultTemplate?
+    /// The trash icon sits beside the pencil, so deleting asks first.
+    @State private var templatePendingDeletion: VaultTemplate?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -360,14 +415,17 @@ struct TemplatesManagerPane: View {
                                 Image(systemName: "pencil")
                             }
                             .buttonStyle(.borderless)
+                            .help("Edit Template")
+                            .accessibilityLabel("Edit \(template.name)")
 
                             Button(role: .destructive) {
-                                appState.templates.removeAll { $0.id == template.id }
-                                appState.saveUserData()
+                                templatePendingDeletion = template
                             } label: {
                                 Image(systemName: "trash")
                             }
                             .buttonStyle(.borderless)
+                            .help("Delete Template")
+                            .accessibilityLabel("Delete \(template.name)")
                         }
                         .padding(.vertical, 4)
                     }
@@ -396,6 +454,23 @@ struct TemplatesManagerPane: View {
         }
         .sheet(item: $editingTemplate) { template in
             TemplateEditorSheet(template: template)
+        }
+        .confirmationDialog(
+            "Delete \u{201C}\(templatePendingDeletion?.name ?? "")\u{201D}?",
+            isPresented: Binding(
+                get: { templatePendingDeletion != nil },
+                set: { if !$0 { templatePendingDeletion = nil } }
+            ),
+            titleVisibility: .visible,
+            presenting: templatePendingDeletion
+        ) { template in
+            Button("Delete Template", role: .destructive) {
+                appState.templates.removeAll { $0.id == template.id }
+                appState.saveUserData()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { _ in
+            Text("This can’t be undone.")
         }
     }
 }
@@ -492,7 +567,7 @@ struct RulesManagerPane: View {
                 ContentUnavailableView {
                     Label("No Routing Rules", systemImage: "arrow.triangle.branch")
                 } description: {
-                    Text("Rules route documents to a vault automatically based on tags, filename, or content.\nUse Vault → Auto-Route Send (⌃⌘T) to apply them.")
+                    Text("Rules route documents to a vault automatically based on tags, filename, or content.\nUse \(appState.shortcutHelp("Vault → Auto-Route Send", .autoRoute)) to apply them.")
                 } actions: {
                     Button("New Rule") {
                         editingRule = newRule()
@@ -536,7 +611,7 @@ struct RulesManagerPane: View {
     }
 
     private func newRule() -> RoutingRule? {
-        guard let vault = appState.defaultVault else { return nil }
+        guard let vault = appState.defaultVault ?? appState.vaults.first else { return nil }
         return RoutingRule(name: "New Rule", targetVaultId: vault.id, targetFolder: appState.effectiveSendFolder(for: vault))
     }
 }
@@ -545,6 +620,8 @@ struct RuleRow: View {
     @Environment(AppState.self) private var appState
     let rule: RoutingRule
     let onEdit: () -> Void
+    /// The trash icon sits beside the pencil, so deleting asks first.
+    @State private var confirmingDelete = false
 
     private var targetVaultName: String {
         appState.vaults.first(where: { $0.id == rule.targetVaultId })?.displayName ?? "Missing vault"
@@ -552,7 +629,8 @@ struct RuleRow: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            Toggle("", isOn: Binding(
+            // Titled though hidden: VoiceOver reads the title as its name.
+            Toggle(rule.name, isOn: Binding(
                 get: { rule.isEnabled },
                 set: { newValue in
                     if let index = appState.routingRules.firstIndex(where: { $0.id == rule.id }) {
@@ -590,17 +668,33 @@ struct RuleRow: View {
                 Image(systemName: "pencil")
             }
             .buttonStyle(.borderless)
+            .help("Edit Rule")
+            .accessibilityLabel("Edit \(rule.name)")
 
             Button(role: .destructive) {
-                appState.routingRules.removeAll { $0.id == rule.id }
-                appState.saveUserData()
+                confirmingDelete = true
             } label: {
                 Image(systemName: "trash")
             }
             .buttonStyle(.borderless)
+            .help("Delete Rule")
+            .accessibilityLabel("Delete \(rule.name)")
         }
         .padding(.vertical, 4)
         .opacity(rule.isEnabled ? 1 : 0.5)
+        .confirmationDialog(
+            "Delete \u{201C}\(rule.name)\u{201D}?",
+            isPresented: $confirmingDelete,
+            titleVisibility: .visible
+        ) {
+            Button("Delete Rule", role: .destructive) {
+                appState.routingRules.removeAll { $0.id == rule.id }
+                appState.saveUserData()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This can’t be undone.")
+        }
     }
 
     private var conditionSummary: String {
@@ -647,15 +741,23 @@ struct RuleEditorSheet: View {
 
                     ForEach($rule.conditions) { $condition in
                         HStack {
-                            Picker("", selection: $condition.type) {
-                                ForEach(RoutingCondition.ConditionType.allCases, id: \.self) { type in
+                            Picker("Condition type", selection: $condition.type) {
+                                // Source Device only ever matches drafts made on
+                                // this Mac: kept for conditions that use it, not offered.
+                                ForEach(RoutingCondition.ConditionType.allCases.filter { $0 != .sourceDevice || condition.type == .sourceDevice }, id: \.self) { type in
                                     Text(type.rawValue).tag(type)
                                 }
                             }
                             .labelsHidden()
                             .frame(width: 140)
+                            .onChange(of: condition.type) { oldType, newType in
+                                // An untouched Match follows the type.
+                                if condition.matchType == oldType.defaultMatchType {
+                                    condition.matchType = newType.defaultMatchType
+                                }
+                            }
 
-                            Picker("", selection: $condition.matchType) {
+                            Picker("Match", selection: $condition.matchType) {
                                 ForEach(RoutingCondition.MatchType.allCases, id: \.self) { match in
                                     Text(match.rawValue).tag(match)
                                 }
@@ -663,7 +765,7 @@ struct RuleEditorSheet: View {
                             .labelsHidden()
                             .frame(width: 110)
 
-                            TextField("value", text: $condition.value)
+                            TextField(condition.type == .frontmatterKey ? "key: value" : "value", text: $condition.value)
 
                             Button {
                                 rule.conditions.removeAll { $0.id == condition.id }
@@ -671,11 +773,17 @@ struct RuleEditorSheet: View {
                                 Image(systemName: "minus.circle")
                             }
                             .buttonStyle(.borderless)
+                            .help("Remove Condition")
+                        }
+                        if let error = condition.validationError {
+                            Text(error)
+                                .font(.caption)
+                                .foregroundStyle(.red)
                         }
                     }
 
                     Button {
-                        rule.conditions.append(RoutingCondition(type: .tag, value: ""))
+                        rule.conditions.append(RoutingCondition(type: .tag, value: "", matchType: RoutingCondition.ConditionType.tag.defaultMatchType))
                     } label: {
                         Label("Add Condition", systemImage: "plus.circle")
                     }
@@ -708,7 +816,10 @@ struct RuleEditorSheet: View {
                     save()
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(rule.name.trimmingCharacters(in: .whitespaces).isEmpty)
+                // A condition that can never match made the rule silently
+                // fall through to a lower-priority one.
+                .disabled(rule.name.trimmingCharacters(in: .whitespaces).isEmpty
+                          || rule.conditions.contains { $0.validationError != nil })
             }
             .padding()
             .background(.bar)
@@ -718,6 +829,9 @@ struct RuleEditorSheet: View {
     }
 
     private func save() {
+        // "Inbox " would have sent into a second, look-alike folder.
+        rule.name = rule.name.trimmingCharacters(in: .whitespaces)
+        rule.targetFolder = rule.targetFolder.trimmingCharacters(in: .whitespaces)
         if let index = appState.routingRules.firstIndex(where: { $0.id == rule.id }) {
             appState.routingRules[index] = rule
         } else {
@@ -735,6 +849,8 @@ struct AddVaultSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var name: String = ""
+    /// The folder name `name` was filled with, until the user types their own.
+    @State private var autoFilledName: String?
     @State private var selectedURL: URL?
     @State private var inboxPath: String = ""
     @State private var isDefault: Bool = false
@@ -887,12 +1003,28 @@ struct AddVaultSheet: View {
         .frame(width: 480, height: 480)
         .tint(.cmdsAccent)
         .onAppear { detectedVaults = ObsidianLocator.detectedVaults() }
+        // Renamed vaults must not show up as unconnected, or pass as new below.
+        .task { await appState.reconcileVaultLocations() }
     }
 
     private func choose(_ url: URL) {
         selectedURL = url
-        if name.isEmpty { name = url.lastPathComponent }
+        // Follow each pick: keeping the first folder's name labeled the
+        // second vault with it.
+        if name.isEmpty || name == autoFilledName {
+            name = url.lastPathComponent
+            autoFilledName = name
+        }
+        errorMessage = existingVault(at: url).map(alreadyConnectedMessage)
         loadFolders(at: url)
+    }
+
+    private func existingVault(at url: URL) -> Vault? {
+        appState.vaults.first { $0.hasRoot(url) }
+    }
+
+    private func alreadyConnectedMessage(_ vault: Vault) -> String {
+        "Already connected as \u{201C}\(vault.displayName)\u{201D}."
     }
 
     private func selectFolder() {
@@ -930,12 +1062,16 @@ struct AddVaultSheet: View {
 
     private func addVault() {
         guard let url = selectedURL else { return }
+        if let existing = existingVault(at: url) {
+            errorMessage = alreadyConnectedMessage(existing)
+            return
+        }
 
         isAdding = true
         errorMessage = nil
 
         Task {
-            let vaultService = VaultService(dataDirectory: FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!.appendingPathComponent("CmdMD"))
+            let vaultService = VaultService(dataDirectory: AppState.dataDirectory)
 
             do {
                 var vault = try await vaultService.registerVault(name: name, at: url, inboxPath: inboxPath)

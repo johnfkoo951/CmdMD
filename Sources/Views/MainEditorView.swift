@@ -1,4 +1,5 @@
 import SwiftUI
+import WebKit
 
 struct MainEditorView: View {
     @Environment(AppState.self) private var appState
@@ -137,17 +138,21 @@ struct DocumentEditorView: View {
             let previewWidth: CGFloat = mode == .split ? total - editorWidth : total
 
             ZStack(alignment: .topLeading) {
+                // A hidden pane is also hidden from VoiceOver; its view keeps
+                // itself out of keyboard focus (isEditorVisible / isPaneVisible).
                 EditorPane()
                     .frame(width: editorWidth, height: height)
                     .offset(x: mode == .preview ? -total : 0)
                     .animation(fade) { $0.opacity(mode == .preview ? 0 : 1) }
                     .allowsHitTesting(mode != .preview)
+                    .accessibilityHidden(mode == .preview)
 
                 PreviewPane()
                     .frame(width: previewWidth, height: height)
                     .offset(x: mode == .source ? total : (mode == .split ? editorWidth : 0))
                     .animation(fade) { $0.opacity(mode == .source ? 0 : 1) }
                     .allowsHitTesting(mode != .source)
+                    .accessibilityHidden(mode == .source)
 
                 if mode == .split {
                     SplitDividerHandle(
@@ -167,13 +172,80 @@ struct DocumentEditorView: View {
             }
             .clipped()
         }
+        .onAppear {
+            // The first note after the welcome screen, or at launch.
+            PaneFocus.post(mode: appState.viewMode, modeChanged: false)
+        }
         .onChange(of: appState.viewMode) { _, newMode in
             // The hidden editor must not keep keyboard focus, or typing in
-            // preview mode would edit the document invisibly.
-            if newMode == .preview {
-                NSApp.keyWindow?.makeFirstResponder(nil)
+            // preview mode would edit the document invisibly. Only the
+            // editor's: a sidebar or Inspector field keeps its focus.
+            if newMode == .preview, let window = NSApp.keyWindow,
+               PaneFocus.pane(of: window.firstResponder) == .editor {
+                window.makeFirstResponder(nil)
             }
+            PaneFocus.post(mode: newMode, modeChanged: true)
         }
+        .onChange(of: document.id) { _, _ in
+            PaneFocus.post(mode: appState.viewMode, modeChanged: false)
+        }
+    }
+}
+
+/// Keyboard focus for the editor and preview panes, which both stay mounted
+/// in every mode. Nothing used to focus the preview: after ⌘3, opening a
+/// note or a palette command, focus was nowhere, so Space, the arrow keys
+/// and Page Down beeped until the page was clicked.
+enum PaneFocus {
+    enum Pane { case editor, preview }
+
+    /// `.focusVisiblePane`'s object.
+    struct Request {
+        let mode: ViewMode
+        /// A mode switch also takes focus from the other pane (⌘2 while
+        /// reading puts the caret in the editor); a document switch only
+        /// fills a focus that is nowhere.
+        let modeChanged: Bool
+
+        /// The page while reading, the editor in Source and Split.
+        var target: Pane { mode == .preview ? .preview : .editor }
+    }
+
+    /// Asks the pane `mode` shows to take keyboard focus, once the current
+    /// update has applied the mode to both panes.
+    static func post(mode: ViewMode, modeChanged: Bool) {
+        let request = Request(mode: mode, modeChanged: modeChanged)
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: .focusVisiblePane, object: request)
+        }
+    }
+
+    /// The pane holding `responder` (a field editor counts as its field),
+    /// nil for anything else: the sidebar, the Inspector, a search field.
+    static func pane(of responder: NSResponder?) -> Pane? {
+        var view = responder as? NSView
+        if let fieldEditor = responder as? NSTextView, fieldEditor.isFieldEditor,
+           let field = fieldEditor.delegate as? NSView {
+            view = field
+        }
+        while let current = view {
+            // The editor's scroll view also holds its find bar.
+            if current is CmdMDTextView || (current as? NSScrollView)?.documentView is CmdMDTextView {
+                return .editor
+            }
+            if current is WKWebView { return .preview }
+            view = current.superview
+        }
+        return nil
+    }
+
+    /// Whether `request.target` should take focus from `responder`: when
+    /// focus is nowhere, or on a mode switch in the other pane. Never from
+    /// the sidebar or a field: a sidebar click keeps arrow-key browsing.
+    static func shouldTakeFocus(_ request: Request, from responder: NSResponder?, in window: NSWindow) -> Bool {
+        if responder == nil || responder === window { return true }
+        guard request.modeChanged, let pane = pane(of: responder) else { return false }
+        return pane != request.target
     }
 }
 
@@ -184,6 +256,11 @@ struct SplitDividerHandle: View {
     let minFraction: CGFloat
 
     @State private var dragStartFraction: CGFloat?
+    /// Whether our resize cursor is on the NSCursor stack. Every pop is gated
+    /// on it: a handle removed while hovered (⌘1/⌘3) gets no onHover(false),
+    /// so its push used to leak.
+    @State private var cursorPushed = false
+    @State private var isHovering = false
 
     var body: some View {
         Rectangle()
@@ -196,24 +273,46 @@ struct SplitDividerHandle: View {
             )
             .contentShape(Rectangle())
             .onHover { inside in
+                isHovering = inside
                 if inside {
-                    NSCursor.resizeLeftRight.push()
-                } else {
-                    NSCursor.pop()
+                    pushCursor()
+                } else if dragStartFraction == nil {
+                    // Mid-drag the pointer can outrun the 9 pt handle (at the
+                    // clamps); keep the resize cursor until the drag ends.
+                    popCursor()
                 }
             }
+            .onDisappear { popCursor() }
             .gesture(
-                DragGesture()
+                // Global coordinates: this view moves with the drag, so local
+                // translation subtracted the handle's own movement — it
+                // trailed the pointer at about half speed and jittered.
+                DragGesture(minimumDistance: 1, coordinateSpace: .global)
                     .onChanged { value in
-                        let start = dragStartFraction ?? fraction
+                        // From where the handle is drawn: the stored fraction
+                        // can sit outside the clamp after the window narrowed.
+                        let start = dragStartFraction ?? min(max(fraction, minFraction), 1 - minFraction)
                         dragStartFraction = start
                         let proposed = start + value.translation.width / totalWidth
                         fraction = min(max(proposed, minFraction), 1 - minFraction)
                     }
                     .onEnded { _ in
                         dragStartFraction = nil
+                        if !isHovering { popCursor() }
                     }
             )
+    }
+
+    private func pushCursor() {
+        guard !cursorPushed else { return }
+        NSCursor.resizeLeftRight.push()
+        cursorPushed = true
+    }
+
+    private func popCursor() {
+        guard cursorPushed else { return }
+        NSCursor.pop()
+        cursorPushed = false
     }
 }
 
@@ -270,6 +369,7 @@ struct EditorPane: View {
 
         MarkdownTextEditor(
             documentID: appState.currentDocument?.id,
+            isVisible: appState.viewMode != .preview,
             text: Binding(
                 get: { appState.currentDocument?.content ?? "" },
                 set: { appState.updateContent($0) }
@@ -321,7 +421,7 @@ struct EditorPane: View {
                     if let data = item as? Data,
                        let url = URL(dataRepresentation: data, relativeTo: nil) {
                         DispatchQueue.main.async {
-                            handleImageDrop(url)
+                            insertImageMarkdown(handleImageDrop(url))
                         }
                     }
                 }
@@ -331,10 +431,12 @@ struct EditorPane: View {
         return false
     }
 
-    private func handleImageDrop(_ imageURL: URL) {
+    /// Copies a dropped image into ./assets next to the document and returns
+    /// the markdown embedding it (the absolute path for an unsaved draft or a
+    /// failed copy). The text view inserts it at the drop point.
+    private func handleImageDrop(_ imageURL: URL) -> String {
         guard let documentURL = appState.currentDocument?.fileURL else {
-            insertImageMarkdown(imageURL, relativePath: imageURL.path)
-            return
+            return Self.imageMarkdown(for: imageURL, path: imageURL.path)
         }
 
         let documentFolder = documentURL.deletingLastPathComponent()
@@ -348,18 +450,37 @@ struct EditorPane: View {
             let destinationURL = assetsFolder.appendingPathComponent(imageURL.lastPathComponent).uniquified()
             try FileManager.default.copyItem(at: imageURL, to: destinationURL)
 
-            let relativePath = "assets/\(destinationURL.lastPathComponent)"
-            insertImageMarkdown(destinationURL, relativePath: relativePath)
             appState.showToast("Image added")
+            return Self.imageMarkdown(for: destinationURL, path: "assets/\(destinationURL.lastPathComponent)")
         } catch {
-            insertImageMarkdown(imageURL, relativePath: imageURL.path)
+            return Self.imageMarkdown(for: imageURL, path: imageURL.path)
         }
     }
 
-    private func insertImageMarkdown(_ url: URL, relativePath: String) {
-        let imageName = url.deletingPathExtension().lastPathComponent
-        let markdown = "![\(imageName)](\(relativePath))"
+    private static func imageMarkdown(for url: URL, path: String) -> String {
+        imageMarkdown(name: url.deletingPathExtension().lastPathComponent, path: path)
+    }
 
+    /// `![name](path)` with the characters that would end or redirect the
+    /// link destination percent-encoded: whitespace (every macOS screenshot
+    /// name has spaces; `![a](assets/a b.png)` doesn't render), parentheses,
+    /// `#`, `?`, `%`, `<`, `>`, `\`. Everything else — Korean included — stays
+    /// readable, as in Obsidian's own markdown links.
+    static func imageMarkdown(name: String, path: String) -> String {
+        var destination = ""
+        for scalar in path.unicodeScalars {
+            if scalar.properties.isWhitespace || scalar.properties.generalCategory == .control
+                || "#%()<>?\\".unicodeScalars.contains(scalar) {
+                destination += String(scalar).utf8.map { String(format: "%%%02X", $0) }.joined()
+            } else {
+                destination.unicodeScalars.append(scalar)
+            }
+        }
+        return "![\(name)](\(destination))"
+    }
+
+    /// Drops beside the text (the gutter) append the image at the end.
+    private func insertImageMarkdown(_ markdown: String) {
         if var content = appState.currentDocument?.content {
             if content.isEmpty || content.hasSuffix("\n") {
                 content += markdown + "\n"
@@ -380,6 +501,8 @@ struct PreviewPane: View {
 
         MarkdownPreviewView(
             documentID: appState.currentDocument?.id,
+            isVisible: appState.viewMode != .source,
+            positionKey: appState.currentDocument.map(ReadingPositions.key(for:)),
             markdown: appState.currentDocument?.content ?? "",
             baseURL: appState.currentDocument?.fileURL?.deletingLastPathComponent(),
             options: appState.renderOptions(),
@@ -389,6 +512,10 @@ struct PreviewPane: View {
         // The WebView is transparent; this pane paints the theme background so
         // per-render reloads never flash white in dark mode.
         .background(theme.backgroundColor(forDark: colorScheme == .dark))
+        // ⌘F in Preview mode searches the rendered text.
+        .overlay(alignment: .topTrailing) {
+            PreviewFindBar()
+        }
     }
 }
 
@@ -424,10 +551,10 @@ struct WelcomeView: View {
                             WelcomeButton(title: "Open File", subtitle: "Review a Markdown file", icon: "doc.badge.plus", shortcut: "⌘O") {
                                 appState.openFile()
                             }
-                            WelcomeButton(title: "Open Folder", subtitle: "Browse a folder of notes", icon: "folder.badge.plus", shortcut: "⌥⌘O") {
+                            WelcomeButton(title: "Open Folder", subtitle: "Browse a folder of notes", icon: "folder.badge.plus", shortcut: appState.shortcutHint(for: .openFolder)) {
                                 appState.openFolder()
                             }
-                            WelcomeButton(title: "New Draft", subtitle: "Start writing a quick note", icon: "square.and.pencil", shortcut: "⌘N") {
+                            WelcomeButton(title: "New Draft", subtitle: "Start writing a quick note", icon: "square.and.pencil", shortcut: appState.shortcutHint(for: .newDraft)) {
                                 appState.createNewDraft()
                             }
                             WelcomeButton(title: "Add Vault", subtitle: "Connect an Obsidian vault", icon: "folder.badge.gearshape", shortcut: nil) {
@@ -545,6 +672,8 @@ struct WelcomeButton: View {
 extension Notification.Name {
     static let openInternalLink = Notification.Name("openInternalLink")
     static let scrollToHeading = Notification.Name("scrollToHeading")
+    /// The view mode or the document changed. Object: a `PaneFocus.Request`.
+    static let focusVisiblePane = Notification.Name("focusVisiblePane")
 }
 
 #if !SWIFT_PACKAGE

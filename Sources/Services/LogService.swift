@@ -31,7 +31,7 @@ enum Log {
     private static var fileSinkEnabled = true
     private static var handle: FileHandle?
     private static var handleDay = ""
-    private static var didSweep = false
+    private static var lastSweepDay = ""
 
     private static let loggers: [LogCategory: Logger] = Dictionary(
         uniqueKeysWithValues: LogCategory.allCases.map {
@@ -44,24 +44,31 @@ enum Log {
     /// with log output. Honors CMDMD_DATA_DIR like AppState, so an isolated
     /// dev instance never appends to the installed app's log files.
     static var logsDirectory: URL {
-        if let override = ProcessInfo.processInfo.environment["CMDMD_DATA_DIR"], !override.isEmpty {
-            return URL(fileURLWithPath: override, isDirectory: true).appendingPathComponent("logs")
-        }
-        return FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-            .appendingPathComponent("CmdMD")
-            .appendingPathComponent("logs")
+        AppState.dataDirectory.appendingPathComponent("logs")
     }
 
     // MARK: Public API
 
-    static func info(_ message: String, _ category: LogCategory = .app) {
-        loggers[category]?.info("\(message, privacy: .public)")
-        appendToFile(level: "INFO", category: category, message: message)
+    /// `message` must be static text (counts and percentages are fine) — it is
+    /// logged publicly. User-derived text (file/note/vault names, error strings
+    /// that embed paths) goes in `detail`: the file log keeps it verbatim, the
+    /// unified log (Console.app, sysdiagnose) only ever sees a hash of it.
+    static func info(_ message: String, _ category: LogCategory = .app, detail: String? = nil) {
+        if let detail {
+            loggers[category]?.info("\(message, privacy: .public) \(detail, privacy: .private(mask: .hash))")
+        } else {
+            loggers[category]?.info("\(message, privacy: .public)")
+        }
+        appendToFile(level: "INFO", category: category, message: composedMessage(message, detail: detail))
     }
 
-    static func error(_ message: String, _ category: LogCategory = .error) {
-        loggers[category]?.error("\(message, privacy: .public)")
-        appendToFile(level: "ERROR", category: category, message: message)
+    static func error(_ message: String, _ category: LogCategory = .error, detail: String? = nil) {
+        if let detail {
+            loggers[category]?.error("\(message, privacy: .public) \(detail, privacy: .private(mask: .hash))")
+        } else {
+            loggers[category]?.error("\(message, privacy: .public)")
+        }
+        appendToFile(level: "ERROR", category: category, message: composedMessage(message, detail: detail))
     }
 
     /// Mirrors `settings.fileLoggingEnabled`. Called by AppState after settings
@@ -78,6 +85,13 @@ enum Log {
         }
     }
 
+    /// Blocks until every queued file write has been issued. AppKit exits
+    /// right after applicationWillTerminate, so the last lines (a failed
+    /// quit-time save among them) were often lost. Never call it from `queue`.
+    static func flush() {
+        queue.sync {}
+    }
+
     // MARK: Formatting helpers (pure — unit-tested)
 
     /// "cmdmd-2026-07-02.log" for the given date.
@@ -88,6 +102,12 @@ enum Log {
     /// "2026-07-02" — also the day-roll key for the open file handle.
     static func dayString(for date: Date) -> String {
         dayFormatter.string(from: date)
+    }
+
+    /// The file-log text of an entry: the message, then its detail (if any).
+    static func composedMessage(_ message: String, detail: String?) -> String {
+        guard let detail, !detail.isEmpty else { return message }
+        return "\(message) \(detail)"
     }
 
     /// One formatted log line, newline-terminated.
@@ -112,14 +132,17 @@ enum Log {
         let now = Date()
         let line = formatLine(date: now, level: level, category: category, message: message)
         queue.async {
+            // Before the sink check: retention also applies to files left
+            // behind after "Write log files" was turned off.
+            sweepExpiredLogsIfNeeded(asOf: now)
             guard fileSinkEnabled, let data = line.data(using: .utf8) else { return }
             rollHandleIfNeeded(for: now)
             try? handle?.write(contentsOf: data)
         }
     }
 
-    /// Opens (and creates) today's file on first use or day change, and sweeps
-    /// expired files once per launch. Runs on `queue`.
+    /// Opens (and creates) today's file on first use or day change. Runs on
+    /// `queue`.
     private static func rollHandleIfNeeded(for date: Date) {
         let day = dayString(for: date)
         guard handle == nil || handleDay != day else { return }
@@ -128,23 +151,39 @@ enum Log {
         handle = nil
         handleDay = day
 
+        try? FileManager.default.createDirectory(at: logsDirectory, withIntermediateDirectories: true)
+        handle = openAppendHandle(at: logsDirectory.appendingPathComponent(fileName(for: date)))
+    }
+
+    /// Opens `url` for appending, creating it (0600 — it holds note names) if
+    /// needed. O_APPEND puts every write at the current end of file, so two
+    /// CmdMD processes sharing a logs folder interleave whole lines instead of
+    /// overwriting each other from stale offsets.
+    static func openAppendHandle(at url: URL) -> FileHandle? {
+        let fd = url.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return -1 }
+            return open(path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0o600)
+        }
+        return fd >= 0 ? FileHandle(fileDescriptor: fd, closeOnDealloc: true) : nil
+    }
+
+    /// Sweeps on the first log call of each day — at launch, and after every
+    /// midnight in a long-running menu-bar instance. Runs on `queue`.
+    private static func sweepExpiredLogsIfNeeded(asOf date: Date) {
+        let day = dayString(for: date)
+        guard day != lastSweepDay else { return }
+        lastSweepDay = day
+        sweepExpiredLogs(in: logsDirectory, asOf: date)
+    }
+
+    /// Deletes the expired daily logs in `directory`. Never creates it: with
+    /// the sink off there may be no logs folder at all.
+    static func sweepExpiredLogs(in directory: URL, asOf now: Date) {
         let fm = FileManager.default
-        try? fm.createDirectory(at: logsDirectory, withIntermediateDirectories: true)
-
-        if !didSweep {
-            didSweep = true
-            let names = (try? fm.contentsOfDirectory(atPath: logsDirectory.path)) ?? []
-            for name in names where isExpiredLogFile(name, asOf: date) {
-                try? fm.removeItem(at: logsDirectory.appendingPathComponent(name))
-            }
+        let names = (try? fm.contentsOfDirectory(atPath: directory.path)) ?? []
+        for name in names where isExpiredLogFile(name, asOf: now) {
+            try? fm.removeItem(at: directory.appendingPathComponent(name))
         }
-
-        let url = logsDirectory.appendingPathComponent(fileName(for: date))
-        if !fm.fileExists(atPath: url.path) {
-            fm.createFile(atPath: url.path, contents: nil)
-        }
-        handle = try? FileHandle(forWritingTo: url)
-        _ = try? handle?.seekToEnd()
     }
 
     // DateFormatter is thread-safe on modern macOS; both formatters are shared.

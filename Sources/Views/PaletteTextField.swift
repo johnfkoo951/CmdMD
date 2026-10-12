@@ -22,6 +22,9 @@ final class AutoFocusTextField: NSTextField {
 struct PaletteTextField: NSViewRepresentable {
     @Binding var text: String
     var placeholder: String
+    /// What VoiceOver calls the field ("Command Palette"); the placeholder
+    /// alone disappears once typing starts.
+    var accessibilityName: String?
     var onMoveUp: () -> Void = {}
     var onMoveDown: () -> Void = {}
     var onSubmit: () -> Void = {}
@@ -31,6 +34,7 @@ struct PaletteTextField: NSViewRepresentable {
         let field = AutoFocusTextField()
         field.delegate = context.coordinator
         field.placeholderString = placeholder
+        field.setAccessibilityLabel(accessibilityName)
         field.isBordered = false
         field.drawsBackground = false
         field.focusRingType = .none
@@ -77,9 +81,29 @@ struct PaletteTextField: NSViewRepresentable {
             case #selector(NSResponder.cancelOperation(_:)):
                 parent.onCancel()
                 return true
+            case #selector(NSResponder.insertTab(_:)), #selector(NSResponder.insertBacktab(_:)):
+                // Keep focus in the palette. Tab used to move it to the editor
+                // behind the scrim, so typing edited the note.
+                return true
             default:
                 return false
             }
         }
+    }
+}
+
+/// Speaks list highlights for VoiceOver. In the palettes and the completion
+/// popup ↑/↓ move a highlight while focus stays in the text, so nothing
+/// would be read otherwise. `text` is only built while VoiceOver runs.
+enum VoiceOverAnnouncement {
+    static func post(_ text: @autoclosure () -> String) {
+        guard NSWorkspace.shared.isVoiceOverEnabled else { return }
+        AccessibilityNotification.Announcement(text()).post()
+    }
+
+    /// "3 results, Export as PDF…": the count and the top row, which ↩ opens.
+    static func results(_ titles: [String]) -> String {
+        guard let top = titles.first else { return "No matches" }
+        return "\(titles.count == 1 ? "1 result" : "\(titles.count) results"), \(top)"
     }
 }

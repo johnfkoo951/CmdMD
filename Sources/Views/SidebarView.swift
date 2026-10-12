@@ -2,7 +2,6 @@ import SwiftUI
 
 struct SidebarView: View {
     @Environment(AppState.self) private var appState
-    @State private var showSearch = false
     
     var body: some View {
         @Bindable var state = appState
@@ -13,12 +12,12 @@ struct SidebarView: View {
             Divider()
 
             Group {
-                if showSearch {
-                    FolderSearchView(showSearch: $showSearch)
+                if appState.isFolderSearchVisible {
+                    FolderSearchView(showSearch: $state.showFolderSearch)
                 } else {
                     switch appState.selectedSidebarTab {
                     case .files:
-                        FileTreeView(showSearch: $showSearch)
+                        FileTreeView(showSearch: $state.showFolderSearch)
                     case .favorites:
                         FavoritesListView()
                     case .drafts:
@@ -48,21 +47,26 @@ struct SidebarRibbon: View {
                 ) {
                     appState.selectedSidebarTab = tab
                 }
+                // Icon-only: without a label VoiceOver reads the symbol name.
+                .accessibilityLabel(tab.rawValue)
             }
 
             Spacer(minLength: 8)
 
-            RibbonButton(icon: "folder.badge.plus", help: "Open Folder (⌥⌘O)") {
+            RibbonButton(icon: "folder.badge.plus", help: appState.shortcutHelp("Open Folder", .openFolder)) {
                 appState.openFolder()
             }
+            .accessibilityLabel("Open Folder")
             RibbonButton(icon: "doc.badge.plus", help: "Open File (⌘O)") {
                 appState.openFile()
             }
+            .accessibilityLabel("Open File")
             SettingsLink {
                 RibbonIcon(systemName: "gearshape", isActive: false, isHovering: false)
             }
             .buttonStyle(.plain)
             .help("Settings (⌘,)")
+            .accessibilityLabel("Settings")
         }
         .padding(.vertical, 10)
         .frame(maxHeight: .infinity)
@@ -154,17 +158,41 @@ struct FileTreeView: View {
                     SidebarHeader(
                         title: appState.currentFolder?.lastPathComponent ?? "Files"
                     ) {
+                        // The folder's own root: subfolders offer the same
+                        // actions in their context menus.
+                        Menu {
+                            Button {
+                                if let folder = appState.currentFolder { appState.createNewFile(in: folder) }
+                            } label: {
+                                Label("New File", systemImage: "doc.badge.plus")
+                            }
+                            Button {
+                                if let folder = appState.currentFolder { appState.createNewFolder(in: folder) }
+                            } label: {
+                                Label("New Folder", systemImage: "folder.badge.plus")
+                            }
+                        } label: {
+                            Image(systemName: "plus")
+                        }
+                        .menuStyle(.borderlessButton)
+                        .menuIndicator(.hidden)
+                        .fixedSize()
+                        .help("New File or Folder")
+                        .accessibilityLabel("New File or Folder")
+
                         Button { showSearch = true } label: {
                             Image(systemName: "magnifyingglass")
                         }
                         .buttonStyle(.borderless)
                         .help("Search in Folder (⇧⌘F)")
+                        .accessibilityLabel("Search in Folder")
 
-                        Button { appState.loadFileTree() } label: {
+                        Button { appState.refreshFolderState() } label: {
                             Image(systemName: "arrow.clockwise")
                         }
                         .buttonStyle(.borderless)
                         .help("Refresh")
+                        .accessibilityLabel("Refresh")
                     }
 
                     List(selection: $selection) {
@@ -174,7 +202,9 @@ struct FileTreeView: View {
                     }
                     .listStyle(.sidebar)
                     .onChange(of: selection) { _, url in
-                        guard let url else { return }
+                        // Folder rows are selectable too, which keeps →/←
+                        // expand/collapse working; only files open.
+                        guard let url, !AppState.isFolder(at: url) else { return }
                         // Browsing semantics: selecting replaces the current
                         // tab's document (pinned/dirty tabs get a new tab).
                         appState.openDocument(at: url, inNewTab: false)
@@ -266,6 +296,13 @@ struct FolderSearchView: View {
                         .foregroundColor(.secondary)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if !appState.folderSearchText.isEmpty && appState.searchedQuery != appState.folderSearchText {
+                // Searching runs on Return: until then there's nothing to
+                // report, and older results belong to different text.
+                Text("Press Return to search")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if appState.searchResults.isEmpty && !appState.folderSearchText.isEmpty {
                 ContentUnavailableView {
                     Label("No Results", systemImage: "doc.text.magnifyingglass")
@@ -279,18 +316,25 @@ struct FolderSearchView: View {
         .onAppear {
             isSearchFieldFocused = true
         }
+        .onChange(of: appState.folderSearchFocusRequest) {
+            // ⇧⌘F while the search is already showing: focus it again.
+            isSearchFieldFocused = true
+        }
     }
 }
 
 struct SearchResultsList: View {
     @Environment(AppState.self) private var appState
-    
-    private var groupedResults: [URL: [SearchResult]] {
-        Dictionary(grouping: appState.searchResults, by: { $0.fileURL })
-    }
+    /// Keyboard access: ↑/↓ move the selection and Return opens it (clicks
+    /// still open through the tap gesture).
+    @State private var selection: SearchResult.ID?
     
     var body: some View {
-        List {
+        // Grouped once per render — a computed property here re-grouped every
+        // result for the key list and again twice per file section.
+        let groupedResults = Dictionary(grouping: appState.searchResults, by: { $0.fileURL })
+
+        List(selection: $selection) {
             ForEach(Array(groupedResults.keys.sorted(by: { $0.lastPathComponent < $1.lastPathComponent })), id: \.self) { fileURL in
                 Section {
                     ForEach(groupedResults[fileURL] ?? []) { result in
@@ -315,6 +359,11 @@ struct SearchResultsList: View {
             }
         }
         .listStyle(.sidebar)
+        .contextMenu(forSelectionType: SearchResult.ID.self, menu: { _ in }, primaryAction: { ids in
+            for result in appState.searchResults where ids.contains(result.id) {
+                appState.openDocument(at: result.fileURL, inNewTab: true, scrollToLine: result.lineNumber)
+            }
+        })
     }
 }
 
@@ -324,7 +373,7 @@ struct SearchResultRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack {
-                Text("Line \(result.lineNumber)")
+                Text(result.lineNumber.map { "Line \($0)" } ?? "Properties")
                     .font(.caption2)
                     .foregroundColor(.secondary)
                     .padding(.horizontal, 4)
@@ -420,8 +469,22 @@ struct FileTreeContextMenu: View {
             Divider()
 
             Button {
-                appState.batchSendURLs = markdownFiles(in: item.url)
-                appState.showSendToVault = true
+                // Walking a large folder blocks — enumerate off the main thread.
+                let folder = item.url
+                Task {
+                    let urls = await Task.detached(priority: .userInitiated) {
+                        Self.markdownFiles(in: folder)
+                    }.value
+                    // An empty batch would make the sheet send the active
+                    // document instead of this folder.
+                    guard !urls.isEmpty else {
+                        appState.showToast("No Markdown files in \u{201C}\(folder.lastPathComponent)\u{201D}", style: .warning)
+                        return
+                    }
+                    appState.batchSendRoot = folder
+                    appState.batchSendURLs = urls
+                    appState.showSendToVault = true
+                }
             } label: {
                 Label("Send Folder to Vault…", systemImage: "paperplane")
             }
@@ -499,7 +562,7 @@ struct FileTreeContextMenu: View {
     }
 
     /// All Markdown files directly in `folder` and its subfolders (for batch send).
-    private func markdownFiles(in folder: URL) -> [URL] {
+    private nonisolated static func markdownFiles(in folder: URL) -> [URL] {
         guard let enumerator = FileManager.default.enumerator(
             at: folder,
             includingPropertiesForKeys: [.isRegularFileKey],
@@ -515,18 +578,18 @@ struct FileTreeContextMenu: View {
 
 struct FavoritesListView: View {
     @Environment(AppState.self) private var appState
+    /// Keyboard access: ↑/↓ move the selection and Return opens it.
+    @State private var selection: FavoriteItem.ID?
     
     var body: some View {
         VStack(spacing: 0) {
             SidebarHeader(title: "Favorites") { EmptyView() }
 
-            List {
+            List(selection: $selection) {
             ForEach(appState.favorites) { favorite in
                 FavoriteRow(favorite: favorite)
                     .onTapGesture {
-                        if FileManager.default.fileExists(atPath: favorite.url.path) {
-                            appState.openDocument(at: favorite.url, inNewTab: true)
-                        }
+                        appState.openFavorite(favorite)
                     }
                     .contextMenu {
                         Button(role: .destructive) {
@@ -543,6 +606,12 @@ struct FavoritesListView: View {
             }
         }
         .listStyle(.sidebar)
+        .contextMenu(forSelectionType: FavoriteItem.ID.self, menu: { _ in }, primaryAction: { ids in
+            // Same as a click on the row.
+            for favorite in appState.favorites where ids.contains(favorite.id) {
+                appState.openFavorite(favorite)
+            }
+        })
         }
         .overlay {
             if appState.favorites.isEmpty {
@@ -579,11 +648,18 @@ struct FavoriteRow: View {
                 .truncationMode(.middle)
         }
         .padding(.vertical, 2)
+        // The whole row is the click target, not just its text.
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
     }
 }
 
 struct DraftListView: View {
     @Environment(AppState.self) private var appState
+    /// Keyboard access: ↑/↓ move the selection and Return opens it.
+    @State private var selection: Draft.ID?
+    /// Drafts live only in drafts.json, so deleting one asks first.
+    @State private var draftsPendingDeletion: [Draft] = []
     
     var activeDrafts: [Draft] {
         appState.drafts.filter { $0.status == .active }
@@ -598,10 +674,11 @@ struct DraftListView: View {
                     Image(systemName: "plus")
                 }
                 .buttonStyle(.borderless)
-                .help("New Draft (⌘N)")
+                .help(appState.shortcutHelp("New Draft", .newDraft))
+                .accessibilityLabel("New Draft")
             }
 
-            List {
+            List(selection: $selection) {
             ForEach(activeDrafts) { draft in
                 DraftRow(draft: draft)
                     .contentShape(Rectangle())
@@ -618,19 +695,40 @@ struct DraftListView: View {
                         Divider()
 
                         Button(role: .destructive) {
-                            appState.deleteDraft(draft)
+                            draftsPendingDeletion = [draft]
                         } label: {
-                            Label("Delete Draft", systemImage: "trash")
+                            Label("Delete Draft…", systemImage: "trash")
                         }
                     }
             }
             .onDelete { indexSet in
-                for index in indexSet.sorted().reversed() {
-                    appState.deleteDraft(activeDrafts[index])
-                }
+                draftsPendingDeletion = indexSet.sorted().map { activeDrafts[$0] }
             }
         }
         .listStyle(.sidebar)
+        .contextMenu(forSelectionType: Draft.ID.self, menu: { _ in }, primaryAction: { ids in
+            for draft in activeDrafts where ids.contains(draft.id) {
+                appState.openDraft(draft)
+            }
+        })
+        .confirmationDialog(
+            draftsPendingDeletion.count == 1
+                ? "Delete \u{201C}\(draftsPendingDeletion[0].displayTitle)\u{201D}?"
+                : "Delete \(draftsPendingDeletion.count) Drafts?",
+            isPresented: Binding(
+                get: { !draftsPendingDeletion.isEmpty },
+                set: { if !$0 { draftsPendingDeletion = [] } }
+            ),
+            titleVisibility: .visible,
+            presenting: draftsPendingDeletion
+        ) { drafts in
+            Button(drafts.count == 1 ? "Delete Draft" : "Delete Drafts", role: .destructive) {
+                for draft in drafts { appState.deleteDraft(draft) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { _ in
+            Text("Drafts are stored only on this Mac. This can’t be undone.")
+        }
         }
         .overlay {
             if activeDrafts.isEmpty {
@@ -660,12 +758,6 @@ struct DraftRow: View {
                     .lineLimit(1)
                 
                 Spacer()
-                
-                if draft.sourceDevice != Host.current().localizedName {
-                    Image(systemName: "iphone")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
             }
             
             Text(draft.body.prefix(100).replacingOccurrences(of: "\n", with: " "))
@@ -683,6 +775,8 @@ struct DraftRow: View {
 
 struct RecentFilesView: View {
     @Environment(AppState.self) private var appState
+    /// Keyboard access: ↑/↓ move the selection and Return opens it.
+    @State private var selection: URL?
     
     var body: some View {
         VStack(spacing: 0) {
@@ -694,7 +788,7 @@ struct RecentFilesView: View {
                 .disabled(appState.recentFiles.isEmpty)
             }
 
-            List {
+            List(selection: $selection) {
             ForEach(appState.recentFiles, id: \.self) { url in
                 RecentFileRow(url: url)
                     .onTapGesture {
@@ -709,6 +803,11 @@ struct RecentFilesView: View {
             }
         }
         .listStyle(.sidebar)
+        .contextMenu(forSelectionType: URL.self, menu: { _ in }, primaryAction: { urls in
+            for url in appState.recentFiles where urls.contains(url) {
+                appState.openDocument(at: url, inNewTab: true)
+            }
+        })
         }
         .overlay {
             if appState.recentFiles.isEmpty {
@@ -738,6 +837,9 @@ struct RecentFileRow: View {
                 .truncationMode(.middle)
         }
         .padding(.vertical, 2)
+        // The whole row is the click target, not just its text.
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
     }
 }
 

@@ -46,6 +46,7 @@ struct CommandPaletteView: View {
                 PaletteTextField(
                     text: $model.query,
                     placeholder: "Type a command or file name…",
+                    accessibilityName: "Command Palette",
                     onMoveUp: { moveSelection(-1) },
                     onMoveDown: { moveSelection(1) },
                     onSubmit: { executeSelectedCommand() },
@@ -95,6 +96,10 @@ struct CommandPaletteView: View {
                                 model.selectedIndex = index
                                 executeSelectedCommand()
                             }
+                            .accessibilityAction {
+                                model.selectedIndex = index
+                                executeSelectedCommand()
+                            }
                         }
                     }
                     .padding(.vertical, 8)
@@ -121,15 +126,18 @@ struct CommandPaletteView: View {
         }
         .onChange(of: model.query) { _, _ in
             model.selectedIndex = 0
+            // What ↩ would run now; VoiceOver only echoes the typed letters.
+            VoiceOverAnnouncement.post(VoiceOverAnnouncement.results(filteredCommands.map(\.title)))
         }
     }
 
     /// Moves the highlight by `delta`, clamped to the result list.
     private func moveSelection(_ delta: Int) {
-        let count = filteredCommands.count
-        guard count > 0 else { return }
+        let commands = filteredCommands
+        guard !commands.isEmpty else { return }
         model.navigatingByKeyboard = true
-        model.selectedIndex = min(max(model.selectedIndex + delta, 0), count - 1)
+        model.selectedIndex = min(max(model.selectedIndex + delta, 0), commands.count - 1)
+        VoiceOverAnnouncement.post(commands[model.selectedIndex].title)
     }
 
     private func executeSelectedCommand() {
@@ -150,6 +158,7 @@ struct CommandRow: View {
                 .font(.title3)
                 .frame(width: 24)
                 .foregroundStyle(isSelected ? Color.cmdsAccentOn : .secondary)
+                .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(command.title)
@@ -177,6 +186,8 @@ struct CommandRow: View {
         .background(isSelected ? Color.cmdsAccent : Color.clear)
         .clipShape(RoundedRectangle(cornerRadius: 6))
         .padding(.horizontal, 8)
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : [.isButton])
     }
 }
 
@@ -236,7 +247,7 @@ struct Command: Identifiable {
                 title: "New Draft",
                 subtitle: "Create a new draft document",
                 icon: "square.and.pencil",
-                shortcut: "⌘N",
+                shortcut: appState.shortcutHint(for: .newDraft),
                 keywords: ["new", "create", "draft", "note"]
             ) {
                 appState.createNewDraft()
@@ -256,7 +267,7 @@ struct Command: Identifiable {
                 title: "Open Folder",
                 subtitle: "Open a folder of Markdown files",
                 icon: "folder.badge.plus",
-                shortcut: "⌥⌘O",
+                shortcut: appState.shortcutHint(for: .openFolder),
                 keywords: ["open", "folder", "directory"]
             ) {
                 appState.openFolder()
@@ -266,7 +277,7 @@ struct Command: Identifiable {
                 title: "Omnisearch",
                 subtitle: "Search file names and contents everywhere",
                 icon: "sparkle.magnifyingglass",
-                shortcut: "⇧⌘O",
+                shortcut: appState.shortcutHint(for: .omnisearch),
                 keywords: ["omnisearch", "search", "find", "everywhere", "quick", "switcher"]
             ) {
                 appState.showOmnisearch = true
@@ -276,7 +287,7 @@ struct Command: Identifiable {
                 title: "Save",
                 subtitle: "Save the current document",
                 icon: "square.and.arrow.down",
-                shortcut: "⌘S",
+                shortcut: appState.shortcutHint(for: .save),
                 keywords: ["save", "write"]
             ) {
                 Task { await appState.saveCurrentDocument() }
@@ -286,7 +297,7 @@ struct Command: Identifiable {
                 title: "Reload from Disk",
                 subtitle: "Discard in-memory changes and reload",
                 icon: "arrow.clockwise",
-                shortcut: "⌥⌘R",
+                shortcut: appState.shortcutHint(for: .reloadFromDisk),
                 keywords: ["reload", "refresh", "revert"]
             ) {
                 appState.reloadCurrentDocument()
@@ -296,7 +307,7 @@ struct Command: Identifiable {
                 title: "Quick Capture",
                 subtitle: "Capture a quick note",
                 icon: "bolt",
-                shortcut: "⇧⌘M",
+                shortcut: appState.shortcutHint(for: .quickCapture),
                 keywords: ["quick", "capture", "note", "scratch"]
             ) {
                 appState.showQuickCapture = true
@@ -306,7 +317,7 @@ struct Command: Identifiable {
                 title: "Send to Vault",
                 subtitle: "Send current file to an Obsidian vault",
                 icon: "paperplane",
-                shortcut: "⇧⌘T",
+                shortcut: appState.shortcutHint(for: .sendToVault),
                 keywords: ["send", "vault", "obsidian", "route"]
             ) {
                 appState.showSendToVault = true
@@ -316,10 +327,20 @@ struct Command: Identifiable {
                 title: "Auto-Route Send",
                 subtitle: "Send using routing rules, no dialog",
                 icon: "arrow.triangle.branch",
-                shortcut: "⌃⌘T",
+                shortcut: appState.shortcutHint(for: .autoRoute),
                 keywords: ["auto", "route", "send", "rule"]
             ) {
                 appState.autoRouteCurrentDocument()
+            },
+
+            Command(
+                title: "Open in Obsidian",
+                subtitle: "Open the current file in Obsidian",
+                icon: "arrow.up.forward.app",
+                shortcut: appState.keyBinding(for: .openInObsidian).displayString,
+                keywords: ["obsidian", "open", "vault", "external"]
+            ) {
+                appState.openCurrentDocumentInObsidian()
             },
 
             Command(
@@ -336,7 +357,7 @@ struct Command: Identifiable {
                 title: "Source View",
                 subtitle: "Show source code only",
                 icon: "text.alignleft",
-                shortcut: "⌘1",
+                shortcut: appState.shortcutHint(for: .sourceMode),
                 keywords: ["view", "source", "edit", "code"]
             ) {
                 appState.viewMode = .source
@@ -346,7 +367,7 @@ struct Command: Identifiable {
                 title: "Split View",
                 subtitle: "Show editor and preview side by side",
                 icon: "rectangle.split.2x1",
-                shortcut: "⌘2",
+                shortcut: appState.shortcutHint(for: .splitMode),
                 keywords: ["view", "split", "side"]
             ) {
                 appState.viewMode = .split
@@ -356,7 +377,7 @@ struct Command: Identifiable {
                 title: "Preview",
                 subtitle: "Show rendered preview only",
                 icon: "eye",
-                shortcut: "⌘3",
+                shortcut: appState.shortcutHint(for: .previewMode),
                 keywords: ["view", "preview", "render"]
             ) {
                 appState.viewMode = .preview
@@ -366,7 +387,7 @@ struct Command: Identifiable {
                 title: "Toggle Sidebar",
                 subtitle: "Show or hide the sidebar",
                 icon: "sidebar.left",
-                shortcut: appState.keyBinding(for: .toggleSidebar).displayString,
+                shortcut: appState.shortcutHint(for: .toggleSidebar),
                 keywords: ["sidebar", "toggle", "hide", "show"]
             ) {
                 appState.toggleSidebar()
@@ -376,7 +397,7 @@ struct Command: Identifiable {
                 title: "Toggle Inspector",
                 subtitle: "Show or hide the inspector panel",
                 icon: "sidebar.right",
-                shortcut: appState.keyBinding(for: .toggleInspector).displayString,
+                shortcut: appState.shortcutHint(for: .toggleInspector),
                 keywords: ["inspector", "toggle", "info", "details", "toc", "properties"]
             ) {
                 appState.toggleInspector()
@@ -386,7 +407,7 @@ struct Command: Identifiable {
                 title: "Zoom In",
                 subtitle: "Enlarge editor and preview together",
                 icon: "plus.magnifyingglass",
-                shortcut: appState.keyBinding(for: .zoomIn).displayString,
+                shortcut: appState.shortcutHint(for: .zoomIn),
                 keywords: ["zoom", "in", "bigger", "enlarge", "magnify"]
             ) {
                 appState.zoomIn()
@@ -396,7 +417,7 @@ struct Command: Identifiable {
                 title: "Zoom Out",
                 subtitle: "Shrink editor and preview together",
                 icon: "minus.magnifyingglass",
-                shortcut: appState.keyBinding(for: .zoomOut).displayString,
+                shortcut: appState.shortcutHint(for: .zoomOut),
                 keywords: ["zoom", "out", "smaller", "shrink"]
             ) {
                 appState.zoomOut()
@@ -406,7 +427,7 @@ struct Command: Identifiable {
                 title: "Actual Size",
                 subtitle: "Reset zoom to 100%",
                 icon: "1.magnifyingglass",
-                shortcut: appState.keyBinding(for: .resetZoom).displayString,
+                shortcut: appState.shortcutHint(for: .resetZoom),
                 keywords: ["zoom", "reset", "actual", "size", "100"]
             ) {
                 appState.resetZoom()
@@ -465,7 +486,8 @@ struct Command: Identifiable {
             }
         ]
 
-        for theme in EditorTheme.allCases {
+        // Not allCases: CMDS Light is CMDS's automatic light-mode variant.
+        for theme in EditorTheme.selectableCases {
             commands.append(Command(
                 title: "Editor Theme: \(theme.rawValue)",
                 subtitle: nil,
@@ -503,6 +525,20 @@ struct Command: Identifiable {
             })
         }
 
+        // Drafts have no file, so this is their keyboard route besides the
+        // sidebar list.
+        for draft in appState.drafts where draft.status == .active {
+            commands.append(Command(
+                title: "Open Draft: \(draft.displayTitle)",
+                subtitle: nil,
+                icon: "doc.text",
+                shortcut: nil,
+                keywords: ["draft", draft.displayTitle]
+            ) {
+                appState.openDraft(draft)
+            })
+        }
+
         for vault in appState.vaults {
             commands.append(Command(
                 title: "Send to \(vault.displayName)",
@@ -517,7 +553,11 @@ struct Command: Identifiable {
                     options.targetFolder = appState.effectiveSendFolder(for: vault)
                     options.conflictResolution = appState.settings.conflictResolution
                     options.injectFrontmatter = appState.settings.injectFrontmatterByDefault
-                    try? await appState.sendToVault(options: options)
+                    do {
+                        try await appState.sendToVault(options: options)
+                    } catch {
+                        appState.errorMessage = "Send to \(vault.displayName) failed: \(error.localizedDescription)"
+                    }
                 }
             })
         }

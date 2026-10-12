@@ -4,7 +4,7 @@ The public landing page for CmdMD.
 
 - **Live:** https://cmdmd.cmdspace.work
 - **Source repo:** https://github.com/johnfkoo951/CmdMD-web
-- **Local path:** `/Users/yohankoo/DEV/cmdmd-web/` (separate repo, *not* part of this app repo)
+- **Local checkout:** a sibling of this repo (e.g. `../cmdmd-web`) — separate repo, *not* part of this app repo
 
 ## What it is
 
@@ -23,7 +23,7 @@ not mockups. To refresh them, recapture, then copy into **both** `CmdMD/docs/ima
 ## Deploy
 
 ```bash
-cd /Users/yohankoo/DEV/cmdmd-web
+cd ../cmdmd-web                # sibling checkout of CmdMD-web
 ./scripts/build-og.sh          # regenerate the 1200×630 OG image (Chrome headless), if OG changed
 vercel deploy --prod --yes     # Vercel project "cmdmd"
 ```
@@ -34,4 +34,5 @@ vercel deploy --prod --yes     # Vercel project "cmdmd"
 
 Edit `cmdmd-web/index.html` directly. Download buttons point at
 `https://github.com/johnfkoo951/CmdMD/releases/latest`, so they track new releases automatically —
-only the hero eyebrow / OG version pill (`v1.4.6`) is hard-coded and worth bumping on a major release.
+only the hero eyebrow / OG version pill (`vX.Y.Z`) is hard-coded. Bump it on **every** release
+(then rebuild the OG image and redeploy), or the site keeps advertising an older build.

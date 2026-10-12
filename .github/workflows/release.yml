@@ -17,18 +17,47 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Full history + tags: the version check reads the previous release tag.
+          fetch-depth: 0
 
       # Guard against version drift: the DMG name + bundle version come from
-      # package_app.sh, not the tag. Fail loudly if they disagree.
+      # VERSION (package_app.sh writes them into Info.plist), not the tag. Fail
+      # loudly if they disagree, or if CFBundleVersion did not go up since the
+      # previous release tag.
       - name: Verify tag matches app version
         run: |
+          version_value() { awk -F= -v key="$1" '$1 == key && !found++ { print substr($0, length(key) + 2) }'; }
           TAG_VER="${GITHUB_REF_NAME#v}"
-          PLIST_VER="$(grep -A1 CFBundleShortVersionString scripts/package_app.sh | grep -o '[0-9][0-9.]*' | head -1)"
-          echo "tag=$TAG_VER  package_app.sh=$PLIST_VER"
-          if [ "$TAG_VER" != "$PLIST_VER" ]; then
-            echo "::error::Tag $GITHUB_REF_NAME does not match CFBundleShortVersionString $PLIST_VER in scripts/package_app.sh — bump it before tagging."
+          APP_VER="$(version_value CFBundleShortVersionString < VERSION)"
+          APP_BUILD="$(version_value CFBundleVersion < VERSION)"
+          echo "tag=$TAG_VER  VERSION=$APP_VER ($APP_BUILD)"
+          if [ "$TAG_VER" != "$APP_VER" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match CFBundleShortVersionString $APP_VER in VERSION — bump it before tagging."
             exit 1
           fi
+          PREV_TAG="$(git describe --tags --abbrev=0 --match 'v*' "$GITHUB_REF_NAME^" 2>/dev/null || true)"
+          if [ -n "$PREV_TAG" ]; then
+            if git cat-file -e "$PREV_TAG:VERSION" 2>/dev/null; then
+              PREV_BUILD="$(git show "$PREV_TAG:VERSION" | version_value CFBundleVersion)"
+            else
+              # Releases before VERSION existed kept the build number in package_app.sh.
+              PREV_BUILD="$(git show "$PREV_TAG:scripts/package_app.sh" \
+                | awk '/<key>CFBundleVersion<\/key>/ && !found++ { getline; gsub(/[^0-9]/, ""); print }')"
+            fi
+            echo "previous release $PREV_TAG: build ${PREV_BUILD:-unknown}"
+            if [ -n "$PREV_BUILD" ] && [ "$APP_BUILD" -le "$PREV_BUILD" ]; then
+              echo "::error::CFBundleVersion $APP_BUILD in VERSION must be greater than $PREV_TAG's ($PREV_BUILD) — bump it before tagging."
+              exit 1
+            fi
+          fi
+
+      # ci.yml runs on the same commit in parallel and cannot block this job, so
+      # the release gates itself: a failing test never gets packaged or published.
+      # --force-resolved-versions builds exactly the committed Package.resolved
+      # pins and fails if the lockfile is stale.
+      - name: Run Tests
+        run: swift test --force-resolved-versions
 
       - name: Package and Validate App Bundle
         run: scripts/test_package_app.sh

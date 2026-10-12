@@ -10,9 +10,12 @@ final class LinkedNoteResolverTests: XCTestCase {
         try "# Nested Note\n".write(to: noteURL, atomically: true, encoding: .utf8)
 
         let resolver = LinkedNoteResolver(roots: [vaultRoot])
+        // Decoded once, by URLComponents, as AppState.openInternalURL reads it.
+        let target = URLComponents(string: "cmdmd://open?note=Knowledge/Nested%20Note%23Overview")?
+            .queryItems?.first?.value ?? ""
 
         XCTAssertEqual(
-            resolver.resolve("Knowledge/Nested%20Note%23Overview"),
+            resolver.resolve(target),
             noteURL.standardizedFileURL
         )
     }

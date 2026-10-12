@@ -10,8 +10,8 @@ DerivedData/
 CmdMD.app/
 
 # Swift Package Manager
+# (Package.resolved is committed on purpose: it pins CI/release dependency versions.)
 .swiftpm/
-Package.resolved
 
 # macOS
 .DS_Store
@@ -47,3 +47,4 @@ landing/.env.local
 
 # Tooling scratch
 .omo/
+__pycache__/

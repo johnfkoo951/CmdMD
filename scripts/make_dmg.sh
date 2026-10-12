@@ -34,9 +34,9 @@ hdiutil create \
   -ov \
   "$DMG" >/dev/null
 
-# Note: the DMG is intentionally left unsigned here. For notarized releases the
-# app inside is Developer ID signed and the DMG is stapled by sign_and_notarize.sh
-# (an ad-hoc DMG signature would add no Gatekeeper value and can fight stapling).
+# Note: the DMG is intentionally left unsigned here (an ad-hoc DMG signature adds
+# no Gatekeeper value). For notarized releases sign_and_notarize.sh Developer-ID
+# signs this DMG, submits it to the notary service and then staples it.
 
 SIZE="$(du -h "$DMG" | cut -f1)"
 echo "==> Created $DMG ($SIZE)"

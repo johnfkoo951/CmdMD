@@ -6,23 +6,42 @@ import Foundation
 enum NoteIndexService {
     static let supportedExtensions: Set<String> = ["md", "markdown", "txt"]
 
-    static func buildIndex(roots: [URL], limit: Int = 8000) -> [VaultNote] {
+    /// `limit` is a safety ceiling for pathological folders (e.g. a dev tree
+    /// full of node_modules), not a working-set size: it caps each root on its
+    /// own, so one huge root can't starve the vaults after it, and the result
+    /// is truncated only after sorting, keeping the most recent notes.
+    /// Folders of tool output, never notes. A dev tree's node_modules made one
+    /// walk take 20 s+ for notes it then dropped. Hidden ones (.git, .build,
+    /// .obsidian) are already skipped by the enumerator.
+    static let skippedFolderNames: Set<String> = ["node_modules", "DerivedData", "Pods", "__pycache__", "venv"]
+
+    static func buildIndex(roots: [URL], limit: Int = 100_000) -> [VaultNote] {
         var notes: [VaultNote] = []
         var seenPaths: Set<String> = []
 
         for root in roots {
             guard let enumerator = FileManager.default.enumerator(
                 at: root,
-                includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey],
+                includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey, .contentModificationDateKey],
                 options: [.skipsHiddenFiles, .skipsPackageDescendants]
             ) else { continue }
 
+            var rootCount = 0
             for case let fileURL as URL in enumerator {
+                // A newer rebuild supersedes this one (AppState.rebuildNoteIndex).
+                if Task.isCancelled { return [] }
+                if skippedFolderNames.contains(fileURL.lastPathComponent),
+                   (try? fileURL.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
+                    enumerator.skipDescendants()
+                    continue
+                }
                 guard supportedExtensions.contains(fileURL.pathExtension.lowercased()) else { continue }
                 let standardized = fileURL.standardizedFileURL
                 guard seenPaths.insert(standardized.path).inserted else { continue }
 
-                let modified = (try? standardized.resourceValues(forKeys: [.contentModificationDateKey]))?
+                // The enumerated URL carries the prefetched date; the
+                // standardized copy would stat the file again.
+                let modified = (try? fileURL.resourceValues(forKeys: [.contentModificationDateKey]))?
                     .contentModificationDate ?? .distantPast
 
                 notes.append(VaultNote(
@@ -32,13 +51,12 @@ enum NoteIndexService {
                     url: standardized
                 ))
 
-                if notes.count >= limit {
-                    return sorted(notes)
-                }
+                rootCount += 1
+                if rootCount >= limit { break }
             }
         }
 
-        return sorted(notes)
+        return Array(sorted(notes).prefix(limit))
     }
 
     /// Recently-modified notes first so completions surface what the user is

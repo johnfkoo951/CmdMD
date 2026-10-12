@@ -4,6 +4,26 @@
 > *"Implement the fix in FIX_FOR_CLAUDE_CODE.md and prove it with the regression test."*
 > Everything needed to reproduce, fix, and verify is below.
 
+## Resolution (after 1.4.8)
+
+1.4.8 shipped fix (A) below, which only works for `/Applications/CmdMD.app`: any other
+copy (the mounted DMG, a translocated download, `~/Applications`, a renamed app) still
+trapped, because the probe in `SyntaxHighlighter` passed on `Contents/Resources`, a path
+the accessor never tries. Now:
+
+- `scripts/package_app.sh` builds universal (`swift build --arch arm64 --arch x86_64`),
+  which uses the Xcode build system. Its generated accessor tries `Bundle.main.resourceURL`
+  first, so the `Contents/Resources` bundle resolves wherever the `.app` lives, without
+  patching. The binary patch and `scripts/fix-highlightr-bundle.py` are gone.
+- `package_app.sh` and `scripts/test_package_app.sh` fail unless every architecture slice
+  carries that accessor and none carries the native one (a baked `.build` path).
+- `SyntaxHighlighter.makeHighlightr()` probes exactly the accessor's candidates with
+  `Bundle(url:)`, so a bundle-less build runs without code highlighting instead of trapping.
+- `scripts/smoke_test_app.sh` is the regression test below, automated: a renamed copy
+  outside `/Applications`, an isolated `CMDMD_DATA_DIR`, a code fence in Split view.
+
+The rest of this document is the original analysis, kept for reference.
+
 ## Status
 
 PR #1 (*"bundle Highlightr SPM resources"*, merged) copies `Highlightr_Highlightr.bundle`
@@ -13,8 +33,9 @@ into `Contents/Resources/`. That is **necessary but not sufficient** — the app
 
 ## Symptom
 
-- Preview-only use looks fine (the editor `NSView` is never instantiated).
 - Switching to **Source (⌘1) / Split (⌘2)**, or restoring a window that had the editor open, crashes immediately.
+- Preview mode is not safe either: the editor pane stays mounted in every view mode and
+  highlights the document when it is created and on every document switch.
 - `EXC_BREAKPOINT (SIGTRAP)` — a Swift `fatalError`.
 
 Top of the crash stack:
@@ -77,7 +98,7 @@ Two options. **(A)** is verified and minimal; **(B)** is the clean, location-ind
 The accessor falls back to `Bundle(path: buildPath)`. Rewrite `buildPath` *in the built binary*
 to the bundle #1 already ships in `Contents/Resources`, **before** codesign re-seals it.
 
-`scripts/fix-highlightr-bundle.py` (included) does an in-place, equal-length, null-padded
+`scripts/fix-highlightr-bundle.py` (removed after 1.4.8, see Resolution) did an in-place, equal-length, null-padded
 string replacement (Mach-O offsets preserved):
 
 ```

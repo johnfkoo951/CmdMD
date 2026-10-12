@@ -1,8 +1,11 @@
 import XCTest
 @testable import CmdMD
 
-final class AppWindowTitleTests: XCTestCase {
+/// Sandboxed: AppState() reads the data directory (and its session-restore
+/// Task rewrites it), which must never be the developer's real one.
+final class AppWindowTitleTests: IsolatedDataDirTestCase {
     func testWindowTitleFallsBackToAppNameWithoutDocument() {
+        XCTAssertEqual(AppState.dataDirectory.standardizedFileURL, dataDir.standardizedFileURL)
         let appState = AppState()
 
         XCTAssertEqual(appState.windowTitle, "CmdMD")

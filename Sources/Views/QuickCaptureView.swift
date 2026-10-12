@@ -6,8 +6,15 @@ import SwiftUI
 struct QuickCaptureView: View {
     @Environment(AppState.self) private var appState
     var onDone: (() -> Void)?
+    /// Reports the typed text as it changes; the floating panel keeps it so a
+    /// hidden capture survives quitting and comes back on the next hot key.
+    var onTextChange: ((String) -> Void)? = nil
 
     @State private var noteText: String = ""
+    @State private var confirmingDiscard = false
+    /// Shown in the panel itself: the app-wide alert and toasts live in the
+    /// editor window, which the menu-bar capture can't count on.
+    @State private var errorMessage: String?
     @FocusState private var isTextFieldFocused: Bool
 
     var body: some View {
@@ -55,22 +62,36 @@ struct QuickCaptureView: View {
                 .font(.body)
                 .scrollContentBackground(.hidden)
                 .focused($isTextFieldFocused)
+                .onChange(of: noteText) { _, text in onTextChange?(text) }
                 .frame(minHeight: 140, maxHeight: 220)
                 .padding(8)
 
             Divider()
 
             HStack {
-                Text("\(noteText.count) characters")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                if let errorMessage {
+                    Label(errorMessage, systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .lineLimit(2)
+                        .help(errorMessage)
+                } else {
+                    Text("\(noteText.count) characters")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
 
                 Spacer()
 
                 // HIG order: Cancel (⎋) beside the prominent default action.
                 // ⌘↩ saves — a bare Return must keep inserting newlines.
                 Button("Cancel") {
-                    onDone?()
+                    // A reflexive ⎋ must not silently throw typed text away.
+                    if noteText.isEmpty {
+                        onDone?()
+                    } else {
+                        confirmingDiscard = true
+                    }
                 }
                 .keyboardShortcut(.cancelAction)
 
@@ -85,6 +106,21 @@ struct QuickCaptureView: View {
         }
         .frame(width: 360)
         .tint(.cmdsAccent)
+        .confirmationDialog(
+            "Discard this note?",
+            isPresented: $confirmingDiscard,
+            titleVisibility: .visible
+        ) {
+            Button("Save as Draft") { saveDraft() }
+            Button("Discard", role: .destructive) {
+                noteText = ""
+                errorMessage = nil
+                onDone?()
+            }
+            Button("Keep Editing", role: .cancel) {}
+        } message: {
+            Text("It hasn't been saved or sent.")
+        }
         .onAppear {
             isTextFieldFocused = true
         }
@@ -109,30 +145,34 @@ struct QuickCaptureView: View {
         appState.addDraft(draft)
         appState.showToast("Saved to Drafts")
         noteText = ""
+        errorMessage = nil
         onDone?()
     }
 
     private func sendToVault(_ vault: Vault) {
         guard !noteText.isEmpty else { return }
         let document = capturedDocument()
+        errorMessage = nil
 
         Task {
             var options = SendOptions()
             options.targetVault = vault
             options.targetFolder = appState.effectiveSendFolder(for: vault)
-            options.conflictResolution = appState.settings.conflictResolution
+            options.conflictResolution = appState.settings.conflictResolution.nonDestructive
             options.injectFrontmatter = appState.settings.injectFrontmatterByDefault
 
             do {
                 // Pass the document explicitly — quick capture has no active tab,
                 // so routing through currentDocument would silently drop the note.
-                try await appState.sendToVault(document: document, options: options)
+                let outcome = try await appState.sendToVault(document: document, options: options)
+                // Only a written note may clear the capture.
+                guard case .sent = outcome else { return }
                 await MainActor.run {
                     noteText = ""
                     onDone?()
                 }
             } catch {
-                appState.errorMessage = error.localizedDescription
+                showError(error)
             }
         }
     }
@@ -142,11 +182,15 @@ struct QuickCaptureView: View {
     private func autoRoute() {
         guard !noteText.isEmpty else { return }
         let document = capturedDocument()
+        errorMessage = nil
 
         guard let rule = appState.matchingRoutingRule(for: document),
               let vault = appState.vaults.first(where: { $0.id == rule.targetVaultId }) else {
             if let fallback = appState.defaultVault {
                 sendToVault(fallback)
+            } else {
+                // Default vault "None": don't guess one. The text stays.
+                errorMessage = "No routing rule matches — choose a vault from Send"
             }
             return
         }
@@ -156,38 +200,53 @@ struct QuickCaptureView: View {
             options.targetVault = vault
             options.targetFolder = rule.targetFolder
             options.injectFrontmatter = rule.injectFrontmatter
-            options.conflictResolution = appState.settings.conflictResolution
+            options.conflictResolution = appState.settings.conflictResolution.nonDestructive
 
             do {
-                try await appState.sendToVault(document: document, options: options, quiet: true)
+                let outcome = try await appState.sendToVault(document: document, options: options, quiet: true)
                 await MainActor.run {
+                    if let message = outcome.unsentMessage {
+                        // Nothing was written: say so and keep the text.
+                        errorMessage = message
+                        return
+                    }
                     appState.showToast("Routed to \(vault.displayName)/\(rule.targetFolder)")
                     noteText = ""
                     onDone?()
                 }
             } catch {
-                appState.errorMessage = error.localizedDescription
+                showError(error)
             }
         }
     }
 
+    private func showError(_ error: Error) {
+        Log.error("quick capture send failed", .send, detail: error.localizedDescription)
+        errorMessage = error.localizedDescription
+    }
+
     private func extractTitle(from text: String) -> String {
-        let lines = text.components(separatedBy: .newlines)
-
-        for line in lines {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("# ") {
-                return String(trimmed.dropFirst(2))
-            }
+        // The draft-title rules: a `# ` heading near the top, else the first
+        // line without Markdown markers. A typed `---` properties block is
+        // skipped; it used to name the note "---.md".
+        if let title = MarkdownDocument.contentTitle(of: text, firstLine: true) {
+            return title
         }
 
-        if let firstLine = lines.first, !firstLine.isEmpty {
-            return String(firstLine.prefix(50))
-        }
-
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd HH:mm"
+        let formatter = DateFormatter.fixedFormat("yyyy-MM-dd HH:mm")
         return "Quick Note \(formatter.string(from: Date()))"
+    }
+}
+
+extension FileConflictResolution {
+    /// For a brand-new note such as a capture: Skip would throw the typed text
+    /// away and Overwrite would replace whatever unrelated note shares its
+    /// first line, so both fall back to Rename.
+    var nonDestructive: FileConflictResolution {
+        switch self {
+        case .rename, .timestamp: return self
+        case .overwrite, .skip: return .rename
+        }
     }
 }
 

@@ -12,6 +12,15 @@ enum InspectorTab: String, CaseIterable {
         case .send: return "paperplane"
         }
     }
+
+    /// What VoiceOver and the tooltip call the section.
+    var title: String {
+        switch self {
+        case .toc: return "Table of Contents"
+        case .properties: return "Properties"
+        case .send: return "Send"
+        }
+    }
 }
 
 struct InspectorView: View {
@@ -62,13 +71,16 @@ struct InspectorTabBar: View {
 
     var body: some View {
         Picker("Inspector Section", selection: $selectedTab) {
+            // Labels, shown as icons (like ViewModePicker): a bare Image had
+            // VoiceOver read the symbol's name instead of the section's.
             ForEach(InspectorTab.allCases, id: \.self) { tab in
-                Image(systemName: tab.icon)
-                    .help(tab.rawValue)
+                Label(tab.title, systemImage: tab.icon)
+                    .help(tab.title)
                     .tag(tab)
             }
         }
         .pickerStyle(.segmented)
+        .labelStyle(.iconOnly)
         .labelsHidden()
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -185,7 +197,9 @@ struct InspectorBottomSection: View {
     @State private var showingInfo: Bool = false
     @State private var wordCount = 0
     @State private var characterCount = 0
-    @State private var hasCounted = false
+    /// The document the counts are for. Only typing in it is debounced: a
+    /// tab switch counts at once instead of showing the last note's numbers.
+    @State private var countedID: UUID?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -230,15 +244,22 @@ struct InspectorBottomSection: View {
         .animation(.easeInOut(duration: 0.2), value: showingInfo)
         // Debounced like the status bar — full-document counting per keystroke
         // with the inspector open was pure main-thread waste.
-        .task(id: appState.currentDocument?.content ?? "") {
-            guard let content = appState.currentDocument?.content else { return }
-            if hasCounted {
+        .task(id: appState.currentDocument?.contentRevision) {
+            guard let document = appState.currentDocument else { return }
+            let content = document.content
+            if countedID == document.id {
                 try? await Task.sleep(nanoseconds: 300_000_000)
                 guard !Task.isCancelled else { return }
             }
-            wordCount = DocumentStatsView.countWords(in: content)
-            characterCount = content.count
-            hasCounted = true
+            // Off the main actor like DocumentStatsView: the task inherits it,
+            // and counting a large note stalled the UI on every pause.
+            let counts = await Task.detached(priority: .userInitiated) {
+                (DocumentStatsView.countWords(in: content), content.count)
+            }.value
+            guard !Task.isCancelled else { return }
+            wordCount = counts.0
+            characterCount = counts.1
+            countedID = document.id
         }
     }
 }
@@ -262,6 +283,7 @@ struct CompactInfoRow: View {
 }
 
 struct TableOfContentsSection: View {
+    @Environment(AppState.self) private var appState
     let document: MarkdownDocument
 
     // Shared with the renderer (fence-aware, deduplicating slugger) so a TOC
@@ -270,7 +292,10 @@ struct TableOfContentsSection: View {
     // document on every keystroke (twice — isEmpty check + ForEach) was a
     // measurable slice of typing latency.
     @State private var headings: [TOCHeading] = []
-    @State private var hasParsed = false
+    /// The document `headings` belong to. Only typing in it is debounced:
+    /// after a tab switch the last note's rows stayed up, and clickable
+    /// (scrolling to its lines), for the whole debounce.
+    @State private var parsedID: UUID?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -282,20 +307,30 @@ struct TableOfContentsSection: View {
                     .font(.callout)
                     .foregroundStyle(.secondary)
             } else {
-                VStack(alignment: .leading, spacing: 4) {
+                // Lazy: a long note's TOC only builds the rows on screen.
+                LazyVStack(alignment: .leading, spacing: 4) {
                     ForEach(headings) { heading in
                         TOCHeadingRow(heading: heading)
                     }
                 }
             }
         }
-        .task(id: document.content) {
-            if hasParsed {
+        .task(id: document.contentRevision) {
+            if parsedID == document.id {
                 try? await Task.sleep(nanoseconds: 300_000_000)
                 guard !Task.isCancelled else { return }
             }
-            headings = TOCBuilder.extractHeadings(from: document.content)
-            hasParsed = true
+            // Parsed off the main actor (the task inherits it). Headings carry
+            // stable ids, and an unchanged list isn't reassigned, so a pause
+            // that didn't touch a heading leaves the rows alone.
+            let content = document.content
+            let options = appState.renderOptions()
+            let parsed = await Task.detached(priority: .userInitiated) {
+                TOCBuilder.extractHeadings(from: content, options: options)
+            }.value
+            guard !Task.isCancelled else { return }
+            if parsed != headings { headings = parsed }
+            parsedID = document.id
         }
     }
 }
@@ -353,6 +388,15 @@ struct FrontmatterSection: View {
     @State private var showAddProperty: Bool = false
     @State private var newPropertyKey: String = ""
     @State private var newPropertyValue: String = ""
+    /// Custom values as editing began, so each keystroke keeps the property's
+    /// original type even while the text passes through "fals" or "".
+    @State private var editBaseline: [String: FrontmatterValue] = [:]
+    /// The text typed per custom key: a list re-joined from its parsed items
+    /// would swallow the ", " typed before the next item.
+    @State private var editDrafts: [String: String] = [:]
+    /// Frontmatter dates are calendar days held as midnight UTC, so they are
+    /// shown and picked in UTC; local time showed them a day early west of it.
+    private static let utc = TimeZone(secondsFromGMT: 0) ?? .current
     
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -363,17 +407,23 @@ struct FrontmatterSection: View {
                 if document.frontmatter != nil {
                     Button {
                         isEditing.toggle()
+                        editBaseline = isEditing ? (document.frontmatter?.custom ?? [:]) : [:]
+                        editDrafts = [:]
                     } label: {
                         Image(systemName: isEditing ? "checkmark.circle.fill" : "pencil.circle")
                             .foregroundStyle(isEditing ? .green : .secondary)
                     }
                     .buttonStyle(.plain)
+                    .help(isEditing ? "Done Editing" : "Edit Properties")
+                    .accessibilityLabel(isEditing ? "Done Editing" : "Edit Properties")
                 }
             }
             
             if let frontmatter = document.frontmatter {
                 VStack(alignment: .leading, spacing: 2) {
-                    if let title = frontmatter.title {
+                    // Kept while editing, like aliases: an emptied title is
+                    // nil, and the row (with the field being typed in) went.
+                    if frontmatter.title != nil || isEditing {
                         PropertyRow(
                             icon: "textformat",
                             label: "title",
@@ -384,7 +434,7 @@ struct FrontmatterSection: View {
                                     .textFieldStyle(.plain)
                                     .font(.callout)
                             } else {
-                                Text(title)
+                                Text(frontmatter.title ?? "")
                                     .font(.callout)
                                     .foregroundStyle(.primary)
                             }
@@ -394,16 +444,26 @@ struct FrontmatterSection: View {
                     PropertyRow(
                         icon: "calendar",
                         label: "date",
-                        isEditing: isEditing
+                        isEditing: isEditing,
+                        onDelete: isEditing && frontmatter.date != nil ? { updateFrontmatter { $0.date = nil } } : nil
                     ) {
-                        if isEditing {
+                        if isEditing, frontmatter.date != nil {
                             DatePicker("", selection: dateBinding, displayedComponents: .date)
                                 .labelsHidden()
                                 .datePickerStyle(.compact)
+                                .environment(\.timeZone, Self.utc)
                         } else if let date = frontmatter.date {
-                            Text(date.formatted(.dateTime.day().month().year()))
+                            Text(date.formatted(Date.FormatStyle(timeZone: Self.utc).day().month().year()))
                                 .font(.callout)
                                 .foregroundStyle(.primary)
+                        } else if isEditing {
+                            // A picker here showed today for a date that isn't set.
+                            Button("Set Date") {
+                                updateFrontmatter { $0.date = Frontmatter.calendarDay() }
+                            }
+                            .buttonStyle(.plain)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
                         } else {
                             Text("Not set")
                                 .font(.callout)
@@ -450,6 +510,26 @@ struct FrontmatterSection: View {
                             }
                         }
                     }
+
+                    // Read into its own field, so it had no row: a note's
+                    // cssclass could only be seen by adding it again.
+                    if frontmatter.cssclass != nil || isEditing {
+                        PropertyRow(
+                            icon: "paintbrush",
+                            label: "cssclass",
+                            isEditing: isEditing
+                        ) {
+                            if isEditing {
+                                TextField("CSS class", text: binding(for: \.cssclass, default: ""))
+                                    .textFieldStyle(.plain)
+                                    .font(.callout)
+                            } else {
+                                Text(frontmatter.cssclass ?? "")
+                                    .font(.callout)
+                                    .foregroundStyle(.primary)
+                            }
+                        }
+                    }
                     
                     ForEach(Array(frontmatter.custom.keys.sorted()), id: \.self) { key in
                         PropertyRow(
@@ -476,7 +556,11 @@ struct FrontmatterSection: View {
                                 keyText: $newPropertyKey,
                                 valueText: $newPropertyValue,
                                 onAdd: {
-                                    addCustomProperty(key: newPropertyKey, value: newPropertyValue)
+                                    // An unreadable date stays in the row to be fixed.
+                                    guard addCustomProperty(key: newPropertyKey, value: newPropertyValue) else {
+                                        NSSound.beep()
+                                        return
+                                    }
                                     newPropertyKey = ""
                                     newPropertyValue = ""
                                     showAddProperty = false
@@ -503,6 +587,21 @@ struct FrontmatterSection: View {
                 .padding(8)
                 .background(Color(nsColor: .controlBackgroundColor))
                 .cornerRadius(8)
+            } else if let source = document.frontmatterSource {
+                // A block that isn't plain YAML properties is kept as the file
+                // has it; adding properties would stack a second block on it.
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("These properties can't be edited here, so they're kept exactly as written.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text(source.yaml.prefix(4000).trimmingCharacters(in: .newlines))
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                }
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(nsColor: .controlBackgroundColor))
+                .cornerRadius(8)
             } else {
                 VStack(spacing: 8) {
                     Text("No properties")
@@ -516,23 +615,39 @@ struct FrontmatterSection: View {
                 }
             }
         }
+        .onChange(of: document.id) {
+            // This section outlives a tab switch; the next note's edits start
+            // over, and a half-typed property or tag isn't added to it.
+            editBaseline = isEditing ? (document.frontmatter?.custom ?? [:]) : [:]
+            editDrafts = [:]
+            showAddProperty = false
+            newPropertyKey = ""
+            newPropertyValue = ""
+            newTagText = ""
+        }
     }
     
     private var dateBinding: Binding<Date> {
         Binding(
-            get: { document.frontmatter?.date ?? Date() },
+            get: { document.frontmatter?.date ?? Frontmatter.calendarDay() },
             set: { newDate in
                 updateFrontmatter { fm in
-                    fm.date = newDate
+                    fm.date = Frontmatter.calendarDay(newDate, in: Self.utc)
                 }
             }
         )
     }
     
+    /// The Aliases field's raw text lives in `editDrafts` like a custom key's:
+    /// re-joining the parsed list on every keystroke swallowed the ", " typed
+    /// before the next alias. The NUL prefix can't collide with a YAML key.
+    private static let aliasesDraftKey = "\u{0}aliases"
+
     private var aliasesBinding: Binding<String> {
         Binding(
-            get: { document.frontmatter?.aliases.joined(separator: ", ") ?? "" },
+            get: { editDrafts[Self.aliasesDraftKey] ?? document.frontmatter?.aliases.joined(separator: ", ") ?? "" },
             set: { newValue in
+                editDrafts[Self.aliasesDraftKey] = newValue
                 let aliases = newValue.split(separator: ",").map { String($0).trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
                 updateFrontmatter { fm in
                     fm.aliases = aliases
@@ -554,10 +669,12 @@ struct FrontmatterSection: View {
     
     private func customBinding(for key: String) -> Binding<String> {
         Binding(
-            get: { document.frontmatter?.custom[key]?.displayString ?? "" },
+            get: { editDrafts[key] ?? document.frontmatter?.custom[key]?.displayString ?? "" },
             set: { newValue in
+                editDrafts[key] = newValue
+                let original = editBaseline[key] ?? document.frontmatter?.custom[key]
                 updateFrontmatter { fm in
-                    fm.custom[key] = .string(newValue)
+                    fm.custom[key] = .edited(newValue, keeping: original)
                 }
             }
         )
@@ -580,37 +697,41 @@ struct FrontmatterSection: View {
         }
     }
     
-    private func addCustomProperty(key: String, value: String) {
-        let trimmedKey = key.trimmingCharacters(in: .whitespaces).lowercased()
-        guard !trimmedKey.isEmpty else { return }
+    /// False when the property was refused (an unreadable date).
+    private func addCustomProperty(key: String, value: String) -> Bool {
+        var addedKey: String?
         updateFrontmatter { fm in
-            fm.custom[trimmedKey] = .string(value)
+            addedKey = fm.setProperty(key, to: value)
         }
+        guard let addedKey else { return false }
+        editDrafts[addedKey] = nil
+        return true
     }
     
     private func removeCustomProperty(_ key: String) {
+        editDrafts[key] = nil
         updateFrontmatter { fm in
             fm.custom.removeValue(forKey: key)
         }
     }
     
     private func updateFrontmatter(_ update: (inout Frontmatter) -> Void) {
-        guard var doc = appState.currentDocument,
-              var frontmatter = doc.frontmatter else { return }
+        guard var frontmatter = appState.currentDocument?.frontmatter else { return }
         update(&frontmatter)
-        doc.frontmatter = frontmatter
-        appState.currentDocument = doc
+        // Through AppState, so a draft keeps it and autosave sees it.
+        appState.updateFrontmatter(frontmatter)
     }
     
     private func addFrontmatter() {
-        guard var doc = appState.currentDocument else { return }
+        guard let doc = appState.currentDocument else { return }
         // Set the frontmatter model only; the body stays untouched. fullText
         // composes the YAML block on save.
-        doc.frontmatter = Frontmatter(
-            title: doc.displayTitle,
-            date: Date()
-        )
-        appState.currentDocument = doc
+        appState.updateFrontmatter(Frontmatter(
+            // Not the "Untitled Draft" placeholder: as the properties' title
+            // it would name the note so for good, whatever is typed into it.
+            title: doc.ownTitle,
+            date: Frontmatter.calendarDay()
+        ))
         isEditing = true
     }
 }
@@ -646,6 +767,8 @@ struct PropertyRow<Content: View>: View {
                         .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
+                .help("Remove \(label)")
+                .accessibilityLabel("Remove \(label)")
             }
         }
         .padding(.vertical, 4)
@@ -669,6 +792,8 @@ struct EditableTagChip: View {
                         .font(.system(size: 8, weight: .bold))
                 }
                 .buttonStyle(.plain)
+                .help("Remove Tag")
+                .accessibilityLabel("Remove tag \(tag)")
             }
         }
         .padding(.horizontal, 8)
@@ -746,6 +871,8 @@ struct AddPropertyRow: View {
             }
             .buttonStyle(.plain)
             .disabled(keyText.isEmpty)
+            .help("Add Property")
+            .accessibilityLabel("Add Property")
             
             Button {
                 onCancel()
@@ -754,6 +881,8 @@ struct AddPropertyRow: View {
                     .foregroundStyle(.secondary)
             }
             .buttonStyle(.plain)
+            .help("Cancel")
+            .accessibilityLabel("Cancel")
         }
         .padding(.vertical, 4)
         .onAppear {
@@ -818,7 +947,7 @@ struct QuickActionsSection: View {
             VStack(spacing: 8) {
                 if let url = appState.currentDocument?.fileURL {
                     Button {
-                        openInObsidian(url: url)
+                        appState.openInObsidian(fileURL: url)
                     } label: {
                         Label("Open in Obsidian", systemImage: "arrow.up.forward.app")
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -842,22 +971,6 @@ struct QuickActionsSection: View {
                 }
                 .buttonStyle(.bordered)
             }
-        }
-    }
-
-    private func openInObsidian(url: URL) {
-        // Vault folder names are what Obsidian actually keys on (the display
-        // alias broke links); fall back to a path-based open outside any vault.
-        if let vault = appState.vaults.first(where: { $0.contains(url) }),
-           let obsidianURL = vault.obsidianURL(forFile: url) {
-            NSWorkspace.shared.open(obsidianURL)
-            return
-        }
-
-        var components = URLComponents(string: "obsidian://open")!
-        components.queryItems = [URLQueryItem(name: "path", value: url.path)]
-        if let obsidianURL = components.url {
-            NSWorkspace.shared.open(obsidianURL)
         }
     }
 

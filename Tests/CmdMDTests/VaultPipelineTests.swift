@@ -6,7 +6,7 @@ final class VaultPipelineTests: XCTestCase {
 
     func testTemplateFilenamePlaceholders() {
         let template = VaultTemplate(name: "Daily", filenamePattern: "{{date}} {{title}}")
-        let date = DateComponents(calendar: .current, year: 2026, month: 6, day: 12, hour: 9, minute: 30).date!
+        let date = DateComponents(calendar: Calendar(identifier: .gregorian), year: 2026, month: 6, day: 12, hour: 9, minute: 30).date!
 
         XCTAssertEqual(template.generateFilename(title: "Standup", date: date), "2026-06-12 Standup")
     }
@@ -65,11 +65,10 @@ final class VaultPipelineTests: XCTestCase {
 
     func testObsidianURLUsesFolderNameNotAlias() throws {
         let vault = Vault(name: "My Pretty Alias", rootPath: URL(fileURLWithPath: "/Users/x/Vaults/RealFolder"))
-        let url = try XCTUnwrap(vault.obsidianURL(forFile: URL(fileURLWithPath: "/Users/x/Vaults/RealFolder/Inbox/Note.md")))
+        let url = try XCTUnwrap(vault.obsidianURL())
         let components = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false))
 
         XCTAssertEqual(components.queryItems?.first(where: { $0.name == "vault" })?.value, "RealFolder")
-        XCTAssertEqual(components.queryItems?.first(where: { $0.name == "file" })?.value, "Inbox/Note.md")
     }
 
     // MARK: Send-folder resolution (global default + per-vault priority)

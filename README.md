@@ -1,5 +1,8 @@
 <div align="center">
 
+[![🇬🇧 English](https://img.shields.io/badge/🇬🇧-English-134538?style=flat-square)](README.md)
+[![🇰🇷 한국어](https://img.shields.io/badge/🇰🇷-한국어-E985A2?style=flat-square)](README.ko.md)
+
 <img src="Resources/appicon-1024.png" width="120" alt="CmdMD icon" />
 
 # CmdMD
@@ -71,8 +74,9 @@ Grab the latest build from the [**Releases**](../../releases) page:
 - **`CmdMD-<version>.dmg`** — open it and drag `CmdMD.app` onto the **Applications** shortcut.
 - **`CmdMD-macos.zip`** — unzip and move `CmdMD.app` to `/Applications` (same thing, no mount).
 
-The app is **ad‑hoc signed**, so on first launch Gatekeeper may warn. Either right‑click →
-**Open**, or clear the quarantine flag:
+The app is **ad‑hoc signed** (not notarized), so Gatekeeper blocks the first launch. On
+macOS 15 and later, open it once, then go to **System Settings → Privacy & Security →
+Open Anyway** (on macOS 14, right‑click → **Open** still works). Or clear the quarantine flag:
 
 ```bash
 xattr -dr com.apple.quarantine /Applications/CmdMD.app
@@ -88,7 +92,10 @@ cd CmdMD
 
 swift build                         # debug build
 swift run                           # run it
-swift test                          # 67 tests
+swift test                          # run the test suite
+
+# Running next to an installed CmdMD? Keep the dev build's settings, session and logs apart:
+CMDMD_DATA_DIR="$HOME/Library/Application Support/CmdMD-dev" swift run
 
 swift build -c release              # release binary
 bash scripts/package_app.sh         # → dist/CmdMD.app + dist/CmdMD-macos.zip
@@ -107,6 +114,7 @@ Defaults mirror common Obsidian bindings; every action is remappable in **Settin
 | Toggle right sidebar | `⌃⌘→` | | Save / Save As | `⌘S` `⇧⌘S` |
 | Copy file path | `⌥⌘C` | | Find in document | `⌘F` |
 | Zoom in / out | `⌘=` `⌘−` (or pinch) | | Actual size | `⌘0` |
+| Open in Obsidian | `⌥⌘J` | | | |
 
 ## Sending to a vault
 
@@ -128,3 +136,5 @@ The `cmdmd://open?note=<name>` URL scheme resolves a note against the open folde
 ## License
 
 [MIT](LICENSE) © 2026 CMDSPACE · 구요한
+
+Built by **Yohan Koo (CMDSPACE)** · [cmdspace.work](https://cmdspace.work)

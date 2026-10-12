@@ -1,9 +1,11 @@
 # Signing & Notarizing CmdMD releases
 
-CmdMD currently ships **ad-hoc signed** — Gatekeeper shows an "unidentified
-developer / cannot be checked" warning on first launch (workaround: right-click →
-Open, or `xattr -dr com.apple.quarantine`). To remove that warning entirely, the
-app must be **Developer ID signed + notarized by Apple**.
+CmdMD currently ships **ad-hoc signed** (not notarized) — Gatekeeper blocks the
+first launch with an "Apple could not verify…" warning. Workaround: on macOS 15+,
+open it once, then **System Settings → Privacy & Security → Open Anyway**
+(right-click → Open no longer bypasses Gatekeeper there; it still works on macOS 14),
+or run `xattr -dr com.apple.quarantine /Applications/CmdMD.app`. To remove that
+warning entirely, the app must be **Developer ID signed + notarized by Apple**.
 
 The release pipeline is already wired for this: `scripts/sign_and_notarize.sh`
 runs automatically on a tag **only when the signing secrets below exist**. Until
@@ -59,7 +61,11 @@ Add all six:
 | `MACOS_NOTARY_TEAM_ID` | your 10-char Team ID |
 
 Once `MACOS_CERTIFICATE` and `MACOS_NOTARY_APPLE_ID` are set, the next `v*` tag
-automatically signs, notarizes, and staples — no warning for end users.
+automatically signs, notarizes, and staples — no warning for end users. There are two
+notary submissions per release: the app (as a zip), whose stapled copy goes into the
+zip and the DMG, then the Developer-ID-signed DMG itself, which `stapler` can only
+staple once it has a ticket of its own. Either verdict other than `Accepted` fails the
+job before anything is published.
 
 ## 5. (Optional) sign + notarize locally
 
@@ -70,6 +76,10 @@ export MACOS_CERTIFICATE_PWD=… MACOS_SIGN_IDENTITY=… \
 export MACOS_CERTIFICATE="$(base64 -i cert.p12)"
 bash scripts/sign_and_notarize.sh    # → notarized, stapled dmg + zip
 ```
+
+The decoded `.p12`, the throwaway keychain and the notarization zip live in a private
+`mktemp -d` directory that is removed (and the keychain deleted) on exit, also when a
+step fails, e.g. on a wrong `.p12` password.
 
 Verify the result:
 

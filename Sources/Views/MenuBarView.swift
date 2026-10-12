@@ -4,10 +4,17 @@ import SwiftUI
 struct MenuBarView: View {
     @Environment(AppState.self) private var appState
     @Environment(\.openWindow) private var openWindow
+    /// The menu-bar extra's window, so a finished capture can close it.
+    @State private var hostWindow: NSWindow?
 
     var body: some View {
         VStack(spacing: 0) {
-            QuickCaptureView()
+            // Cancel (⎋), Discard, Save as Draft and a sent note close the
+            // panel. Without a handler, Cancel and ⎋ did nothing here.
+            QuickCaptureView {
+                // Next turn, so a closing confirmation dialog finishes first.
+                DispatchQueue.main.async { hostWindow?.close() }
+            }
 
             Divider()
 
@@ -31,6 +38,7 @@ struct MenuBarView: View {
             .padding(.vertical, 8)
         }
         .background(.regularMaterial)
+        .background(WindowAccessor(window: $hostWindow))
     }
 }
 

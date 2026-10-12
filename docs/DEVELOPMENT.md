@@ -161,7 +161,53 @@ CmdMD isn't sandboxed (it already loads Mermaid/KaTeX over the network), so
 
 ## Release flow
 
-`scripts/package_app.sh` builds release, bundles `dist/CmdMD.app` (+ `AppIcon.icns`
-and the brand book glyph), ad-hoc signs, and zips. Pushing a `vX.Y.Z` tag triggers
-`release.yml`, which runs `scripts/test_package_app.sh` on a macОS runner and
-publishes `CmdMD-macos.zip`. Bump the two version strings in `package_app.sh`.
+`scripts/package_app.sh` builds a universal (arm64 + x86_64) release, bundles
+`dist/CmdMD.app` (+ the SwiftPM resource bundles, `AppIcon.icns` and the brand book
+glyph), ad-hoc signs, and zips. It needs full Xcode, not just the Command Line Tools:
+more than one `--arch` switches SwiftPM to the Xcode build system, whose generated
+`Bundle.module` accessors look in `Contents/Resources`. The native build system's
+accessor never does (it tries the `.app` root and a baked `.build` path), which crashed
+1.4.6–1.4.8 on the first highlighted code block anywhere but `/Applications`, so the
+script refuses any slice that carries it.
+
+The version lives only in `VERSION` (`CFBundleShortVersionString` and
+`CFBundleVersion`); `package_app.sh` writes both into `Info.plist`. Bump both before
+tagging. `swift run` / `swift build` binaries have no Info.plist: About reads
+"Version dev" and they skip the update check. Before tagging, run
+`bash scripts/smoke_test_app.sh` (and once with `--without-highlightr-bundle`): it
+launches a renamed copy of `dist/CmdMD.app` outside `/Applications` with an isolated
+`CMDMD_DATA_DIR`, opens a note with a code fence in Split view, and fails on an early
+exit, a new crash report, or no "Code highlighting ready" in the log. Pushing a
+`vX.Y.Z` tag triggers `release.yml` on a macOS runner, which:
+
+1. fails unless the tag matches `CFBundleShortVersionString` in `VERSION` and
+   `CFBundleVersion` is greater than the previous release tag's;
+2. runs `swift test` — `ci.yml` runs in parallel on the same commit and cannot block
+   the release, so the release gates itself;
+3. runs `scripts/test_package_app.sh` (package + universal / per-slice Highlightr
+   accessor / version / document-type / codesign checks);
+4. builds the DMG with `scripts/make_dmg.sh` (ad-hoc), or `scripts/sign_and_notarize.sh`
+   once the Developer ID secrets exist (see `RELEASE_SIGNING.md`);
+5. publishes `CmdMD-macos.zip`, `CmdMD-<version>.dmg` and `SHA256SUMS.txt`.
+
+`ci.yml` also runs `scripts/test_package_app.sh` on every push / PR, so packaging
+breakage shows up before a tag, not after.
+
+**Dependencies are locked.** `Package.resolved` is committed, and `ci.yml` /
+`release.yml` resolve with `--force-resolved-versions`: every build uses the pinned
+versions, and a stale lockfile fails instead of silently re-resolving. Bump on
+purpose — `swift package update`, then `scripts/test_package_app.sh`, then
+`scripts/smoke_test_app.sh` (packaging depends on Highlightr's generated
+resource-bundle lookup; see `FIX_FOR_CLAUDE_CODE.md`).
+
+## Dev isolation — `CMDMD_DATA_DIR`
+
+A plain `swift run` shares `~/Library/Application Support/CmdMD/` (settings, session,
+drafts, logs…) with the installed app. Point a dev instance at its own directory:
+
+```bash
+CMDMD_DATA_DIR="$HOME/Library/Application Support/CmdMD-dev" swift run
+```
+
+`AppState` keeps every data JSON there and `LogService` writes to its `logs/`
+subfolder, so the dev build never touches the installed app's data.

@@ -2,8 +2,8 @@ import SwiftUI
 
 /// ⇧⌘O everything-search: fuzzy file-name matching over the note index
 /// (open folder + registered vaults, recents boosted) plus live full-text
-/// matches from the open folder. Enter opens the hit — content matches jump
-/// straight to the matched line.
+/// matches from the same folder and vaults. Enter opens the hit — content
+/// matches jump straight to the matched line.
 /// Reference-type state — the ↑/↓ key monitor is an escaping closure, and mutating
 /// @State through a captured View value won't re-render; an @Observable object does.
 @Observable final class OmnisearchModel {
@@ -12,6 +12,9 @@ import SwiftUI
     var navigatingByKeyboard = false
     var contentResults: [SearchResult] = []
     var isSearchingContent = false
+    /// File-name hits for `query`, scored once per query (or index) change —
+    /// not on every render, arrow key and hovered row.
+    var fileHits: [OmnisearchView.Hit] = []
 }
 
 struct OmnisearchView: View {
@@ -31,20 +34,34 @@ struct OmnisearchView: View {
             case content
         }
 
-        let id = UUID()
         let kind: Kind
         let title: String
         let subtitle: String
         let url: URL
         let line: Int?
+        /// The search result a content hit shows. A match in the properties
+        /// has no line, so it is told apart by this.
+        var resultID: UUID?
+
+        /// Stable across re-scoring (a fresh UUID per pass made every row new
+        /// on every render). A file hit and a content hit in the same file
+        /// differ by the line (or result) suffix.
+        var id: String {
+            line.map { "\(url.path)#\($0)" } ?? resultID.map { "\(url.path)#\($0.uuidString)" } ?? url.path
+        }
     }
+
+    /// In-file matches shown — and so the most the content scan collects.
+    private static let maxContentHits = 12
 
     // MARK: Hit assembly
 
-    private var fileHits: [Hit] {
-        if model.query.isEmpty {
+    /// Fuzzy file-name hits for `query`: recent files for an empty query,
+    /// otherwise the best-scoring notes (recents boosted).
+    static func fileHits(query: String, notes: [VaultNote], recentFiles: [URL]) -> [Hit] {
+        if query.isEmpty {
             // Bare ⇧⌘O = recent files, most useful default.
-            return appState.recentFiles.prefix(8).map { url in
+            return recentFiles.prefix(8).map { url in
                 Hit(
                     kind: .file,
                     title: url.deletingPathExtension().lastPathComponent,
@@ -55,10 +72,10 @@ struct OmnisearchView: View {
             }
         }
 
-        let lowered = model.query.lowercased()
-        let recents = Set(appState.recentFiles)
+        let lowered = query.lowercased()
+        let recents = Set(recentFiles)
 
-        return appState.linkableNotes
+        return notes
             .compactMap { note -> (VaultNote, Int)? in
                 let score = Command.fuzzyScore(query: lowered, in: note.title.lowercased())
                     ?? Command.fuzzyScore(query: lowered, in: note.path.lowercased())
@@ -76,20 +93,48 @@ struct OmnisearchView: View {
             }
     }
 
-    private var contentHits: [Hit] {
-        model.contentResults.prefix(12).map { result in
+    private func refreshFileHits() {
+        model.fileHits = Self.fileHits(
+            query: model.query,
+            notes: appState.linkableNotes,
+            recentFiles: appState.recentFiles
+        )
+    }
+
+    /// In-file hits. Titles match file hits (no extension) and subtitles lead
+    /// with the note's folder, so same-named notes ("index.md" in two
+    /// folders) can be told apart.
+    static func contentHits(results: [SearchResult], roots: [URL]) -> [Hit] {
+        results.map { result in
             Hit(
                 kind: .content,
-                title: result.fileName,
-                subtitle: "L\(result.lineNumber)  \(result.lineContent.trimmingCharacters(in: .whitespaces))",
+                title: result.fileURL.deletingPathExtension().lastPathComponent,
+                subtitle: "\(folderLabel(for: result.fileURL, roots: roots)) · \(result.lineNumber.map { "L\($0)" } ?? "Properties")  \(result.lineContent.trimmingCharacters(in: .whitespaces))",
                 url: result.fileURL,
-                line: result.lineNumber
+                line: result.lineNumber,
+                resultID: result.id
             )
         }
     }
 
+    /// The file's folder relative to the search root holding it, or the
+    /// root's own name for a note at its top level.
+    static func folderLabel(for fileURL: URL, roots: [URL]) -> String {
+        let folder = fileURL.deletingLastPathComponent().standardizedFileURL.path
+        for root in roots {
+            let rootPath = root.standardizedFileURL.path
+            if folder == rootPath { return root.lastPathComponent }
+            if folder.hasPrefix(rootPath + "/") { return String(folder.dropFirst(rootPath.count + 1)) }
+        }
+        return (folder as NSString).lastPathComponent
+    }
+
+    private var contentHits: [Hit] {
+        Self.contentHits(results: Array(model.contentResults.prefix(Self.maxContentHits)), roots: appState.contentSearchRoots)
+    }
+
     private var allHits: [Hit] {
-        fileHits + contentHits
+        model.fileHits + contentHits
     }
 
     // MARK: Body
@@ -106,6 +151,7 @@ struct OmnisearchView: View {
                 PaletteTextField(
                     text: $model.query,
                     placeholder: "Search file names and contents…",
+                    accessibilityName: "Omnisearch",
                     onMoveUp: { moveSelection(-1) },
                     onMoveDown: { moveSelection(1) },
                     onSubmit: { open(at: model.selectedIndex, in: allHits) },
@@ -130,24 +176,31 @@ struct OmnisearchView: View {
 
             Divider()
 
-            if hits.isEmpty {
+            if hits.isEmpty && model.isSearchingContent {
+                // Content hits are still coming — "No Matches" here was premature.
+                ProgressView("Searching contents…")
+                    .controlSize(.small)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if hits.isEmpty {
                 ContentUnavailableView {
                     Label(model.query.isEmpty ? "No Recent Files" : "No Matches", systemImage: "sparkle.magnifyingglass")
                 } description: {
                     Text(model.query.isEmpty
                          ? "Open a folder or some files first — they get indexed for search."
-                         : "No file names or contents match \"\(model.query)\"")
+                         : searchesContent(model.query)
+                            ? "No file names or contents match \"\(model.query)\""
+                            : "No file names match \"\(model.query)\"")
                 }
             } else {
                 ScrollViewReader { proxy in
                     ScrollView {
                         VStack(spacing: 0) {
-                            let fileCount = fileHits.count
+                            let fileCount = model.fileHits.count
                             if fileCount > 0 {
                                 OmnisearchSectionHeader(title: model.query.isEmpty ? "Recent" : "Files")
                             }
                             ForEach(Array(hits.enumerated()), id: \.element.id) { index, hit in
-                                if index == fileCount && !contentHits.isEmpty {
+                                if index == fileCount && !model.contentResults.isEmpty {
                                     OmnisearchSectionHeader(title: "In-file Matches")
                                 }
                                 OmnisearchRow(hit: hit, isSelected: index == model.selectedIndex)
@@ -159,6 +212,9 @@ struct OmnisearchView: View {
                                         }
                                     }
                                     .onTapGesture {
+                                        open(at: index, in: hits)
+                                    }
+                                    .accessibilityAction {
                                         open(at: index, in: hits)
                                     }
                             }
@@ -176,8 +232,8 @@ struct OmnisearchView: View {
 
             HStack(spacing: 12) {
                 Label("\(appState.linkableNotes.count) notes indexed", systemImage: "tray.full")
-                if appState.currentFolder == nil {
-                    Text("Open a folder (⌥⌘O) to enable content search")
+                if appState.contentSearchRoots.isEmpty {
+                    Text("\(appState.shortcutHelp("Open a folder", .openFolder)) to enable content search")
                 }
                 Spacer()
                 Text("↩ open · ↑↓ navigate")
@@ -196,21 +252,35 @@ struct OmnisearchView: View {
                 .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
         )
         .shadow(color: .black.opacity(0.25), radius: 24, y: 12)
+        .onAppear {
+            refreshFileHits()
+        }
         .onDisappear {
             contentSearchTask?.cancel()
         }
         .onChange(of: model.query) { _, newQuery in
             model.selectedIndex = 0
+            refreshFileHits()
             scheduleContentSearch(for: newQuery)
+            // What ↩ would open now; with no file hits yet, wait for contents.
+            if !(model.fileHits.isEmpty && model.isSearchingContent) {
+                VoiceOverAnnouncement.post(VoiceOverAnnouncement.results(allHits.map(\.title)))
+            }
+        }
+        .onChange(of: appState.linkableNotes.count) {
+            // The note index can finish building while the panel is open.
+            refreshFileHits()
         }
     }
 
     /// Moves the highlight by `delta`, clamped to the hit list.
     private func moveSelection(_ delta: Int) {
-        let count = allHits.count
-        guard count > 0 else { return }
+        let hits = allHits
+        guard !hits.isEmpty else { return }
         model.navigatingByKeyboard = true
-        model.selectedIndex = min(max(model.selectedIndex + delta, 0), count - 1)
+        model.selectedIndex = min(max(model.selectedIndex + delta, 0), hits.count - 1)
+        let hit = hits[model.selectedIndex]
+        VoiceOverAnnouncement.post(hit.kind == .content ? "\(hit.title), \(hit.subtitle)" : hit.title)
     }
 
     // MARK: Actions
@@ -222,13 +292,15 @@ struct OmnisearchView: View {
         appState.openDocument(at: hit.url, inNewTab: true, scrollToLine: hit.line)
     }
 
-    /// Debounced full-text search over the open folder. File-name hits update
-    /// instantly; content hits stream in ~250ms after typing pauses.
+    /// Debounced full-text search over the open folder and registered vaults.
+    /// File-name hits update instantly; content hits stream in ~250ms after
+    /// typing pauses. The scan stops at the hits shown instead of reading on
+    /// to 500 matches.
     private func scheduleContentSearch(for query: String) {
         contentSearchTask?.cancel()
         model.contentResults = []
 
-        guard query.count >= 2, appState.currentFolder != nil else {
+        guard searchesContent(query) else {
             model.isSearchingContent = false
             return
         }
@@ -237,11 +309,19 @@ struct OmnisearchView: View {
         contentSearchTask = Task {
             try? await Task.sleep(nanoseconds: 250_000_000)
             guard !Task.isCancelled else { return }
-            let results = await appState.searchContent(query: query)
+            let results = await appState.searchContent(query: query, limit: Self.maxContentHits)
             guard !Task.isCancelled else { return }
             model.contentResults = results
             model.isSearchingContent = false
+            if model.fileHits.isEmpty {
+                VoiceOverAnnouncement.post(VoiceOverAnnouncement.results(allHits.map(\.title)))
+            }
         }
+    }
+
+    /// Whether `query` gets a content search, not just file-name matching.
+    private func searchesContent(_ query: String) -> Bool {
+        query.count >= 2 && !appState.contentSearchRoots.isEmpty
     }
 }
 
@@ -272,6 +352,7 @@ private struct OmnisearchRow: View {
                 .font(.system(size: 14))
                 .frame(width: 22)
                 .foregroundStyle(isSelected ? Color.cmdsAccentOn : .secondary)
+                .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(hit.title)
@@ -291,6 +372,7 @@ private struct OmnisearchRow: View {
                 Image(systemName: "arrow.right.to.line")
                     .font(.caption2)
                     .foregroundStyle(isSelected ? AnyShapeStyle(Color.cmdsAccentOn.opacity(0.6)) : AnyShapeStyle(.tertiary))
+                    .accessibilityHidden(true)
             }
         }
         .padding(.horizontal, 14)
@@ -299,6 +381,8 @@ private struct OmnisearchRow: View {
         .clipShape(RoundedRectangle(cornerRadius: 6))
         .padding(.horizontal, 8)
         .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : [.isButton])
     }
 }
 

@@ -90,8 +90,22 @@ struct FavoriteItem: Identifiable, Equatable, Codable {
         self.alias = alias
     }
 
+    // Resilient decoding (like AppSettings): a key missing from an older or
+    // newer favorites.json falls back to its default instead of failing.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        url = try c.decode(URL.self, forKey: .url)
+        addedAt = try c.decodeIfPresent(Date.self, forKey: .addedAt) ?? Date()
+        alias = try c.decodeIfPresent(String.self, forKey: .alias)
+    }
+
     var displayName: String {
-        alias ?? url.deletingPathExtension().lastPathComponent
+        // Folders and extension-less names show whole: deletingPathExtension()
+        // turned the folder "70. Outputs" into "70".
+        alias ?? (url.hasDirectoryPath || url.pathExtension.isEmpty
+            ? url.lastPathComponent
+            : url.deletingPathExtension().lastPathComponent)
     }
 }
 
@@ -145,11 +159,14 @@ struct FileTreeItem: Identifiable, Hashable {
 struct SearchResult: Identifiable {
     let id: UUID
     let fileURL: URL
-    let lineNumber: Int
+    /// The matched line as the editor numbers it: lines of the body, below
+    /// the frontmatter block. Nil for a match inside that block (a property),
+    /// which the editor doesn't show.
+    let lineNumber: Int?
     let lineContent: String
     let matchRange: Range<String.Index>
 
-    init(fileURL: URL, lineNumber: Int, lineContent: String, matchRange: Range<String.Index>) {
+    init(fileURL: URL, lineNumber: Int?, lineContent: String, matchRange: Range<String.Index>) {
         self.id = UUID()
         self.fileURL = fileURL
         self.lineNumber = lineNumber
@@ -164,16 +181,20 @@ struct SearchResult: Identifiable {
 
 // MARK: - Table of Contents
 
-struct TOCHeading: Identifiable {
-    let id: UUID
+struct TOCHeading: Identifiable, Equatable {
+    /// Position in the document's heading list. Stable across re-parses, so
+    /// the inspector's rows update in place (a fresh UUID per parse rebuilt
+    /// every row on each typing pause), and unique even where slugs collide
+    /// ("Intro", "Intro", "Intro 1" give "intro-1" twice).
+    let id: Int
     let level: Int
     let text: String
     let lineNumber: Int
     /// Deduplicated anchor id matching the preview renderer's heading ids.
     let slug: String
 
-    init(level: Int, text: String, lineNumber: Int, slug: String = "") {
-        self.id = UUID()
+    init(index: Int, level: Int, text: String, lineNumber: Int, slug: String = "") {
+        self.id = index
         self.level = level
         self.text = text
         self.lineNumber = lineNumber
@@ -191,4 +212,32 @@ struct SessionState: Codable, Equatable {
     var currentFolder: URL?
     var sidebarVisible: Bool = false
     var inspectorVisible: Bool = false
+}
+
+// MARK: - Persistence
+
+/// Decodes a JSON array entry by entry, skipping entries that fail, so one
+/// malformed (or newer-format) entry can't take the rest of the list with it.
+struct LossyList<Element: Decodable>: Decodable {
+    var elements: [Element] = []
+    /// Entries that couldn't be decoded and were left out.
+    var skippedCount = 0
+
+    init(from decoder: Decoder) throws {
+        var container = try decoder.unkeyedContainer()
+        while !container.isAtEnd {
+            do {
+                elements.append(try container.decode(Element.self))
+            } catch {
+                skippedCount += 1
+                // A failed decode doesn't advance the container; step over the
+                // bad entry explicitly.
+                _ = try container.decode(SkippedEntry.self)
+            }
+        }
+    }
+
+    private struct SkippedEntry: Decodable {
+        init(from decoder: Decoder) throws {}
+    }
 }

@@ -19,11 +19,18 @@ jobs:
       - name: Swift version
         run: swift --version
 
+      # --force-resolved-versions: build exactly the committed Package.resolved
+      # pins, and fail (instead of silently re-resolving) if it is stale.
       - name: Build (Debug)
-        run: swift build
+        run: swift build --force-resolved-versions
 
       - name: Build (Release)
         run: swift build --configuration release
 
       - name: Run Tests
         run: swift test
+
+      # Exercise packaging on every push/PR too, so a broken package_app.sh or a
+      # missing resource bundle fails here instead of at tag time.
+      - name: Package and Validate App Bundle
+        run: scripts/test_package_app.sh

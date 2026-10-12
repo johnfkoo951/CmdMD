@@ -34,6 +34,7 @@ struct SettingsView: View {
 
 struct GeneralSettingsView: View {
     @Environment(AppState.self) private var appState
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         @Bindable var state = appState
@@ -51,7 +52,7 @@ struct GeneralSettingsView: View {
                 Toggle("Autosave", isOn: $state.settings.autosaveEnabled)
 
                 if appState.settings.autosaveEnabled {
-                    Picker("Autosave interval", selection: $state.settings.autosaveInterval) {
+                    Picker("Autosave every", selection: $state.settings.autosaveInterval) {
                         Text("10 seconds").tag(TimeInterval(10))
                         Text("30 seconds").tag(TimeInterval(30))
                         Text("1 minute").tag(TimeInterval(60))
@@ -84,7 +85,7 @@ struct GeneralSettingsView: View {
             } header: {
                 Text("Window")
             } footer: {
-                Text("Sets the launch size and resizes the current window. “Fit to Markdown layout” matches the preview’s max-width.")
+                Text("Resizes the window now. CmdMD reopens at the size you last used, so these only size a new window, such as on first launch. “Fit to Markdown layout” matches the preview’s max-width.")
                     .font(.caption)
             }
 
@@ -116,7 +117,7 @@ struct GeneralSettingsView: View {
             } header: {
                 Text("Diagnostics")
             } footer: {
-                Text("Key actions (open, save, send, zoom, errors) are logged to Console.app and daily files kept for \(Log.retentionDays) days.")
+                Text("Key actions (open, save, send, zoom, errors) are logged to Console.app and daily files kept for \(Log.retentionDays) days. File and note names appear only in the log files; Console.app shows them hashed.")
                     .font(.caption)
             }
 
@@ -129,7 +130,12 @@ struct GeneralSettingsView: View {
                 Link(destination: AppInfo.github) {
                     Label("GitHub repository", systemImage: "chevron.left.forwardslash.chevron.right")
                 }
-                Button("About CmdMD…") { appState.showAbout = true }
+                Button("About CmdMD…") {
+                    // About is a sheet on the editor window: open or raise it,
+                    // or nothing appears (and it pops up on the next reopen).
+                    openWindow(id: AppWindowPolicy.mainSceneID)
+                    appState.showAbout = true
+                }
             } header: {
                 Text("About")
             } footer: {
@@ -148,6 +154,17 @@ struct GeneralSettingsView: View {
 
 struct EditorSettingsView: View {
     @Environment(AppState.self) private var appState
+    @Environment(\.colorScheme) private var colorScheme
+
+    /// The appearance the editor is drawn in. Settings isn't given the app
+    /// theme's preferredColorScheme, so it's applied here explicitly.
+    private var editorIsDark: Bool {
+        switch appState.settings.theme {
+        case .system: return colorScheme == .dark
+        case .light: return false
+        case .dark: return true
+        }
+    }
 
     var body: some View {
         @Bindable var state = appState
@@ -157,8 +174,9 @@ struct EditorSettingsView: View {
                 Picker("Editor theme", selection: $state.settings.editorTheme) {
                     ForEach(EditorTheme.selectableCases, id: \.self) { theme in
                         HStack {
+                            // CMDS follows the appearance, as in the editor.
                             Circle()
-                                .fill(theme.backgroundColor)
+                                .fill(theme.resolved(forDark: editorIsDark).backgroundColor)
                                 .frame(width: 12, height: 12)
                                 .overlay(Circle().stroke(Color(nsColor: .separatorColor), lineWidth: 1))
                             Text(theme.rawValue)
@@ -167,7 +185,7 @@ struct EditorSettingsView: View {
                     }
                 }
 
-                EditorThemePreview(theme: appState.settings.editorTheme)
+                EditorThemePreview(theme: appState.settings.editorTheme.resolved(forDark: editorIsDark))
             }
 
             Section("Display") {
@@ -182,8 +200,8 @@ struct EditorSettingsView: View {
                     Text("Menlo").tag("Menlo")
                     Text("Monaco").tag("Monaco")
                     Text("Courier New").tag("Courier New")
-                    Text("JetBrains Mono").tag("JetBrains Mono")
-                    Text("Fira Code").tag("Fira Code")
+                    Text(fontLabel("JetBrains Mono")).tag("JetBrains Mono")
+                    Text(fontLabel("Fira Code")).tag("Fira Code")
                 }
 
                 HStack {
@@ -193,7 +211,7 @@ struct EditorSettingsView: View {
                         .frame(width: 50)
                 }
 
-                Text("⌘= / ⌘− zoom the editor and preview together on top of this size; ⌘0 resets. Pinch also works.")
+                Text("\(appState.shortcutHelp("Zoom In", .zoomIn)) and \(appState.shortcutHelp("Zoom Out", .zoomOut)) scale the editor and preview together on top of this size; \(appState.shortcutHelp("Actual Size", .resetZoom)) resets. Pinch also works.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -226,6 +244,12 @@ struct EditorSettingsView: View {
             // all the data JSONs synchronously on the main thread.
             appState.saveUserDataDebounced()
         }
+    }
+
+    /// The editor loads its font with NSFont(name:) and quietly falls back to
+    /// SF Mono, so a font it can't load says so instead of looking chosen.
+    private func fontLabel(_ name: String) -> String {
+        NSFont(name: name, size: 12) == nil ? "\(name) (not installed)" : name
     }
 }
 
@@ -294,7 +318,7 @@ struct PreviewSettingsView: View {
                     Text("System UI").tag("system-ui")
                     Text("Georgia").tag("Georgia, serif")
                     Text("Times New Roman").tag("Times New Roman, serif")
-                    Text("Inter").tag("Inter, sans-serif")
+                    Text(fontLabel("Inter")).tag("Inter, sans-serif")
                     Text("SF Pro Text").tag("SF Pro Text, sans-serif")
                 }
 
@@ -386,10 +410,17 @@ struct PreviewSettingsView: View {
             appState.saveUserDataDebounced()
         }
     }
+
+    /// The preview finds fonts by family and falls back to the system font,
+    /// so a family that isn't installed says so instead of looking chosen.
+    private func fontLabel(_ family: String) -> String {
+        NSFontManager.shared.availableMembers(ofFontFamily: family) == nil ? "\(family) (not installed)" : family
+    }
 }
 
 struct VaultSettingsView: View {
     @Environment(AppState.self) private var appState
+    @Environment(\.openWindow) private var openWindow
     @State private var showAddVault = false
     @State private var defaultVaultFolders: [String] = []
     @State private var vaultPendingRemoval: Vault?
@@ -499,6 +530,8 @@ struct VaultSettingsView: View {
 
             Section {
                 Button("Manage Vaults, Templates & Rules…") {
+                    // A sheet on the editor window, like About above.
+                    openWindow(id: AppWindowPolicy.mainSceneID)
                     appState.showVaultManager = true
                 }
             }
@@ -538,7 +571,7 @@ struct VaultSettingsView: View {
             defaultVaultFolders = []
             return
         }
-        let vaultService = VaultService(dataDirectory: FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!.appendingPathComponent("CmdMD"))
+        let vaultService = VaultService(dataDirectory: AppState.dataDirectory)
         Task {
             var folders = (try? await vaultService.listFolders(in: vault)) ?? []
             let current = appState.settings.defaultSendFolder
@@ -563,7 +596,7 @@ struct ShortcutsSettingsView: View {
             } header: {
                 Text("Keyboard Shortcuts")
             } footer: {
-                Text("Click a shortcut, then press the new key combination. Defaults mirror your Obsidian vault where possible. Press ⎋ to cancel.")
+                Text("Click a shortcut, then press the new key combination — it needs ⌘ or ⌃. Press ⌫ to remove a shortcut, ⎋ to cancel. Defaults mirror your Obsidian vault where possible.")
                     .font(.caption)
             }
 
@@ -583,71 +616,103 @@ struct ShortcutRow: View {
     @Environment(AppState.self) private var appState
     let shortcut: AppShortcut
 
-    @State private var recording = false
     @State private var monitor: Any?
+    @State private var resignObserver: NSObjectProtocol?
+    /// Why the last key press wasn't saved; shown while recording.
+    @State private var note: String?
 
+    /// One row records at a time: starting another row ends this one.
+    private var recording: Bool { appState.recordingShortcut == shortcut }
     private var binding: KeyBinding { appState.keyBinding(for: shortcut) }
     private var isCustom: Bool { appState.settings.keyBindings[shortcut.rawValue] != nil }
 
-    var body: some View {
-        HStack {
-            Text(shortcut.title)
-            Spacer()
-            Button(recording ? "Press keys…" : binding.displayString) {
-                toggleRecord()
-            }
-            .monospaced()
-            .foregroundStyle(recording ? Color.cmdsAccent : .primary)
-            .frame(minWidth: 96)
+    /// A clash the saved binding already has (older versions never checked).
+    private var savedConflict: String? {
+        shortcut.conflict(for: binding, overrides: appState.settings.keyBindings)
+            .map { "Also used by \($0) — only one of them works." }
+    }
 
-            Button {
-                reset()
-            } label: {
-                Image(systemName: "arrow.uturn.backward")
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(shortcut.title)
+                Spacer()
+                Button(recording ? "Press keys…" : binding.displayString) {
+                    toggleRecord()
+                }
+                .monospaced()
+                .foregroundStyle(recording ? Color.cmdsAccent : .primary)
+                .frame(minWidth: 96)
+
+                Button {
+                    reset()
+                } label: {
+                    Image(systemName: "arrow.uturn.backward")
+                }
+                .buttonStyle(.borderless)
+                .help("Reset to default")
+                .opacity(isCustom ? 1 : 0)
+                .disabled(!isCustom)
             }
-            .buttonStyle(.borderless)
-            .help("Reset to default")
-            .opacity(isCustom ? 1 : 0)
-            .disabled(!isCustom)
+
+            if let caption = note ?? savedConflict {
+                Label(caption, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
         }
         .onDisappear { stop() }
+        .onChange(of: appState.recordingShortcut) { _, current in
+            if current != shortcut { stop() }
+        }
     }
 
     private func toggleRecord() {
         if recording { stop(); return }
-        recording = true
+        appState.recordingShortcut = shortcut
+        // Keys typed in another window (the editor behind Settings) end the
+        // recording and go where they were typed instead of becoming the
+        // shortcut; so does leaving the Settings window.
+        let host = NSApp.keyWindow
         monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            guard event.window === host else {
+                stop()
+                return event
+            }
             capture(event)
             return nil   // swallow while recording
         }
+        resignObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didResignKeyNotification, object: host, queue: .main
+        ) { _ in stop() }
     }
 
+    /// A rejected or already-taken combination beeps and keeps recording, with
+    /// the reason under the row; nothing is saved.
     private func capture(_ event: NSEvent) {
-        defer { stop() }
-        if event.keyCode == 53 { return }   // Escape cancels
-
-        let flags = event.modifierFlags
-        let key: String
-        switch event.keyCode {
-        case 123: key = "ArrowLeft"
-        case 124: key = "ArrowRight"
-        case 126: key = "ArrowUp"
-        case 125: key = "ArrowDown"
-        case 49:  key = "Space"
-        default:
-            guard let chars = event.charactersIgnoringModifiers?.lowercased(),
-                  chars.count == 1 else { return }
-            key = chars
+        switch KeyBinding.recorded(keyCode: event.keyCode, characters: event.charactersIgnoringModifiers, modifiers: event.modifierFlags) {
+        case .cancel:
+            stop()
+        case .clear:
+            save(.unbound)
+        case .rejected:
+            NSSound.beep()
+            note = "Shortcuts need ⌘ or ⌃ and a letter, number, symbol, arrow, Space, Return or Tab."
+        case .binding(let b):
+            if let owner = shortcut.conflict(for: b, overrides: appState.settings.keyBindings) {
+                NSSound.beep()
+                note = "\(b.displayString) is already used by \(owner)."
+            } else {
+                save(b)
+            }
         }
+    }
 
-        var b = KeyBinding(key: key)
-        b.command = flags.contains(.command)
-        b.shift = flags.contains(.shift)
-        b.option = flags.contains(.option)
-        b.control = flags.contains(.control)
-
-        appState.settings.keyBindings[shortcut.rawValue] = b
+    private func save(_ b: KeyBinding) {
+        // Recording the default again stores no override, so the row isn't "custom".
+        appState.settings.keyBindings[shortcut.rawValue] = b == shortcut.defaultBinding ? nil : b
         appState.saveUserData()
+        stop()
     }
 
     private func reset() {
@@ -656,10 +721,15 @@ struct ShortcutRow: View {
     }
 
     private func stop() {
-        recording = false
+        note = nil
+        if appState.recordingShortcut == shortcut { appState.recordingShortcut = nil }
         if let m = monitor {
             NSEvent.removeMonitor(m)
             monitor = nil
+        }
+        if let o = resignObserver {
+            NotificationCenter.default.removeObserver(o)
+            resignObserver = nil
         }
     }
 }

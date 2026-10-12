@@ -14,24 +14,39 @@ on:
 
 jobs:
   claude-review:
+    # Public repo: the session reads issue/PR text and diffs anyone can write, so
+    # treat it as untrusted. Only an @claude mention by the owner / a member / a
+    # collaborator starts a run (opened issues included).
     if: |
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
-      github.event_name == 'issues'
+      (
+        (github.event_name == 'issue_comment' || github.event_name == 'pull_request_review_comment') &&
+        contains(github.event.comment.body, '@claude') &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
+      ) || (
+        github.event_name == 'issues' &&
+        (contains(github.event.issue.title, '@claude') || contains(github.event.issue.body, '@claude')) &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association)
+      )
     runs-on: ubuntu-latest
+    # No id-token: the action gets the job token below (contents: read), not the
+    # Claude GitHub App token (contents: write), so it cannot push branches or
+    # v* tags (a v* tag publishes a release via release.yml).
     permissions:
       contents: read
       issues: write
       pull-requests: write
-      id-token: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
+      # Review-only: never --dangerously-skip-permissions (it voids the action's
+      # tool allowlist). Write/exec tools are denied on top of that allowlist, so
+      # an injected prompt can read, search and comment, but not run commands.
       - name: Run Claude Code
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          claude_args: "--dangerously-skip-permissions"
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          claude_args: "--disallowedTools Bash,Edit,MultiEdit,Write,NotebookEdit"

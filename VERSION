@@ -1,0 +1,6 @@
+# CmdMD's version: the single source of truth. scripts/package_app.sh writes both
+# values into the app's Info.plist; the Release workflow requires the v* tag to equal
+# CFBundleShortVersionString and CFBundleVersion to exceed the previous release's.
+# Bump both before tagging.
+CFBundleShortVersionString=1.4.8
+CFBundleVersion=14

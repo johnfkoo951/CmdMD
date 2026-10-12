@@ -21,6 +21,19 @@ func markdownHeadingSlug(_ text: String) -> String {
     return slug.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
 }
 
+/// A parsed heading's visible text, which its anchor is slugged from: text
+/// and code, not markup. `plainText` kept the raw HTML a wiki link, `#tag` or
+/// `==mark==` becomes (`<a href=…>`), so the id matched no TOC slug.
+func headingVisibleText(_ markup: Markup) -> String {
+    switch markup {
+    case let text as Text: return text.string
+    case let code as InlineCode: return code.code
+    case is SoftBreak, is LineBreak: return " "
+    case is InlineHTML: return ""
+    default: return markup.children.map(headingVisibleText).joined()
+    }
+}
+
 /// Deduplicates heading slugs the way GitHub does ("intro", "intro-1", …).
 /// Renderer and TOC each run their own slugger over the same document in the
 /// same order, so duplicate headings resolve to matching anchors on both sides.
@@ -48,29 +61,56 @@ func htmlEscape(_ string: String) -> String {
 }
 
 /// Escapes a URL for an href/src attribute and neutralizes script-bearing
-/// schemes (javascript:, vbscript:, data:text/html).
+/// schemes (javascript:, vbscript:, data: other than images).
 func sanitizeURL(_ url: String) -> String {
     let trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
-    let lower = trimmed.lowercased()
-    if lower.hasPrefix("javascript:") || lower.hasPrefix("vbscript:") || lower.hasPrefix("data:text/html") {
+    if isScriptBearingURL(trimmed) {
         return "#"
     }
     return htmlEscape(trimmed)
 }
 
+/// True for URLs that run script when followed (javascript:, vbscript:) or
+/// can carry a document (data: other than data:image/).
+func isScriptBearingURL(_ url: String) -> Bool {
+    let probe = scriptSchemeProbe(url)
+    if probe.hasPrefix("javascript:") || probe.hasPrefix("vbscript:") {
+        return true
+    }
+    return probe.hasPrefix("data:") && !probe.hasPrefix("data:image/")
+}
+
+/// Lowercased URL with every control character and space removed. Browsers
+/// drop TAB/LF/CR anywhere in a URL and C0/space at its ends, so a scheme
+/// check on the raw string misses `java\tscript:` — which is exactly what
+/// swift-markdown hands over for an entity-encoded `java&#9;script:`.
+func scriptSchemeProbe(_ url: String) -> String {
+    let kept = url.unicodeScalars.filter { $0.value > 0x20 && $0.value != 0x7F }
+    return String(String.UnicodeScalarView(kept)).lowercased()
+}
+
 // MARK: - Table of Contents
 
 enum TOCBuilder {
+    /// Characters that can make a heading's visible text differ from its
+    /// source: links, HTML, entities, escapes, code, emphasis, `==marks==`,
+    /// `#tags`, math. A heading with none needs no parse.
+    private static let inlineMarkup = Set("[<&\\`*_~=#$")
+
     /// Extracts ATX headings with renderer-matching slugs. Fence-aware so a
     /// `# comment` inside a code block doesn't appear in the TOC (and doesn't
-    /// desynchronize slug deduplication from the renderer).
-    static func extractHeadings(from content: String) -> [TOCHeading] {
+    /// desynchronize slug deduplication from the renderer). Pass the
+    /// preview's `options`: they decide how heading text renders.
+    static func extractHeadings(from content: String, options: MarkdownRenderOptions = MarkdownRenderOptions()) -> [TOCHeading] {
         var headings: [TOCHeading] = []
         var slugger = HeadingSlugger()
         var inFence = false
+        var renderer: MarkdownRenderer?
 
-        for (index, line) in content.components(separatedBy: .newlines).enumerated() {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
+        // Split on "\n" only (as the editor and toggleTask do): `.newlines`
+        // counts a CRLF as two breaks, doubling every line number.
+        for (index, line) in content.components(separatedBy: "\n").enumerated() {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
                 inFence.toggle()
                 continue
@@ -86,11 +126,22 @@ enum TOCBuilder {
             let text = afterHashes.trimmingCharacters(in: .whitespaces)
             guard !text.isEmpty else { continue }
 
+            // Slugged from the text the preview shows, as the renderer slugs
+            // it: from the source, a link's URL or a wiki link's markup made
+            // an anchor the preview doesn't have, and the click went nowhere.
+            var visible = text
+            if text.contains(where: inlineMarkup.contains) {
+                let shared = renderer ?? MarkdownRenderer()
+                renderer = shared
+                visible = shared.headingAnchorText(text, options: options)
+            }
+
             headings.append(TOCHeading(
+                index: headings.count,
                 level: level,
-                text: text,
+                text: visible.isEmpty ? text : visible,
                 lineNumber: index + 1,
-                slug: slugger.slug(for: text)
+                slug: slugger.slug(for: visible)
             ))
         }
         return headings
@@ -112,6 +163,11 @@ struct MarkdownRenderOptions: Equatable {
     /// Emit checkbox inputs that post task-toggle messages back to the app.
     /// On for the live preview, off for HTML/PDF export.
     var interactiveTasks: Bool = true
+    /// Folders (besides the note's own) whose images may be shown. Non-nil
+    /// rewrites local `<img>` sources inside them to the app's asset scheme —
+    /// the preview and PDF views can't read file:// URLs. Nil (HTML export,
+    /// clipboard) keeps note-relative sources so the file works elsewhere.
+    var localAssetRoots: [URL]? = nil
 }
 
 // MARK: - Task line mapping
@@ -122,53 +178,69 @@ struct MarkdownRenderOptions: Equatable {
 final class TaskLineQueue {
     private var lines: [Int]
     private var index = 0
+    private var overdrawn = false
 
     init(lines: [Int]) {
         self.lines = lines
     }
 
     func next() -> Int? {
-        guard index < lines.count else { return nil }
+        guard index < lines.count else {
+            overdrawn = true
+            return nil
+        }
         defer { index += 1 }
         return lines[index]
+    }
+
+    /// True when every scanned line went to exactly one rendered checkbox.
+    /// Anything else means the scan and the rendered document disagree about
+    /// which items are tasks, so the line numbers can't be trusted.
+    var isFullyConsumed: Bool {
+        index == lines.count && !overdrawn
     }
 
     static let taskLinePattern = try! NSRegularExpression(
         pattern: #"^(\s*)(?:[-*+]|\d+[.)])\s+\[([ xX])\]\s"#
     )
 
-    /// Scans the ORIGINAL markdown (before any transformation shifts lines) for
-    /// task-list lines, skipping fenced code and callout blocks (callout content
-    /// is rendered separately and stays non-interactive).
+    private static let checkboxMarkerPattern = try! NSRegularExpression(pattern: #"\[[ xX]\]"#)
+
+    /// Source lines of the ORIGINAL markdown's task items (before any
+    /// transformation shifts lines), in the order the visitor meets them. Taken
+    /// from the parsed document rather than a line regex, so it agrees with the
+    /// renderer on every construct the parser decides: ~~~ and nested fences,
+    /// indented code, raw HTML blocks, blockquotes (never checkboxes) and CRLF
+    /// files (one line per CRLF, as toggleTask splits). Callout content is
+    /// blockquoted here and rendered read-only, so it never takes a line.
     static func scan(_ markdown: String) -> [Int] {
-        var lines: [Int] = []
-        var inFence = false
-        var inCallout = false
-
-        for (index, line) in markdown.components(separatedBy: .newlines).enumerated() {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
-                inFence.toggle()
-                inCallout = false
-                continue
-            }
-            if inFence { continue }
-
-            if trimmed.hasPrefix(">") {
-                if trimmed.range(of: #"^>\s*\[!\w+\]"#, options: .regularExpression) != nil {
-                    inCallout = true
-                }
-                if inCallout { continue }
-            } else {
-                inCallout = false
-            }
-
-            let ns = line as NSString
-            if taskLinePattern.firstMatch(in: line, range: NSRange(location: 0, length: ns.length)) != nil {
-                lines.append(index + 1)
-            }
+        // Skip the parse for the common note without any `[ ]`/`[x]`.
+        let ns = markdown as NSString
+        guard checkboxMarkerPattern.firstMatch(in: markdown, range: NSRange(location: 0, length: ns.length)) != nil else {
+            return []
         }
-        return lines
+        var collector = TaskItemCollector()
+        collector.visit(Document(parsing: markdown))
+        return collector.lines
+    }
+
+    private struct TaskItemCollector: MarkupWalker {
+        var lines: [Int] = []
+
+        mutating func visitListItem(_ listItem: ListItem) {
+            if listItem.checkbox != nil {
+                // Line 0 (no source position) keeps the queue aligned and is
+                // rejected by toggleTask.
+                lines.append(listItem.range?.lowerBound.line ?? 0)
+            }
+            descendInto(listItem)
+        }
+
+        // No task item lives inside these; skipping their (mostly inline)
+        // children keeps the walk to the document's block structure.
+        mutating func visitParagraph(_ paragraph: Paragraph) {}
+        mutating func visitHeading(_ heading: Heading) {}
+        mutating func visitTable(_ table: Table) {}
     }
 }
 
@@ -181,8 +253,12 @@ class MarkdownRenderer {
         return allowed
     }()
 
+    /// Obsidian order `[[target|alias]]`: group 2 is the target (may carry a
+    /// `#heading`), group 3 the optional alias (or an embed's size). Neither
+    /// may cross brackets or lines, so several links on a line (or in a table
+    /// row) stay separate.
     private let wikiLinkPattern = try! NSRegularExpression(
-        pattern: #"(!?)\[\[(?:(.+?)\|)?(.+?)\]\]"#,
+        pattern: #"(!?)\[\[([^\[\]|\n]+)(?:\|([^\[\]\n]*))?\]\]"#,
         options: []
     )
 
@@ -192,7 +268,7 @@ class MarkdownRenderer {
     )
 
     private let tagPattern = try! NSRegularExpression(
-        pattern: #"(?<!\S)#([a-zA-Z][a-zA-Z0-9_/-]*)"#,
+        pattern: #"(?<!\S)#("# + MarkdownDocument.tagNamePattern + ")",
         options: []
     )
 
@@ -203,8 +279,14 @@ class MarkdownRenderer {
 
     /// Precompiled masking expressions. Rendering runs frequently while the
     /// user types, so compiling these on every pass is unnecessary work.
+    ///
+    /// ``` and ~~~ fences in ONE source-ordered pattern, so a fence of one
+    /// kind nested in the other stays inside its outer token. As in CommonMark,
+    /// the closing run must use the opener's character, be at least as long and
+    /// carry no info string, and an unclosed fence runs to the end. A backtick
+    /// run followed by another backtick on its line is inline code, not a fence.
     private static let fencedCodePattern = try! NSRegularExpression(
-        pattern: "(?m)^[ \\t]*```[\\s\\S]*?^[ \\t]*```"
+        pattern: #"(?m)^[ \t]*(?:(`{3,})(?![^\n]*`)|(~{3,}))[\s\S]*?(?:^[ \t]*(?:\1`*|\2~*)[ \t]*$|\z)"#
     )
     private static let inlineCodePattern = try! NSRegularExpression(
         pattern: "`[^`\\n]+`"
@@ -218,8 +300,11 @@ class MarkdownRenderer {
     private static let inlineParenMathPattern = try! NSRegularExpression(
         pattern: #"\\\([\s\S]+?\\\)"#
     )
+    /// Pandoc/Obsidian rule, so prose prices ("$5 and $10") aren't math: the
+    /// opening `$` is followed by a non-space, the closing one is preceded by a
+    /// non-space and not followed by a digit; `\$` is a literal dollar.
     private static let inlineDollarMathPattern = try! NSRegularExpression(
-        pattern: #"\$[^$\n]+\$"#
+        pattern: #"(?<![\\$])\$(?=[^\s$])[^$\n]*?[^\s\\$]\$(?![$\d])"#
     )
     private static let codeTokenPattern = try! NSRegularExpression(
         pattern: "\u{E000}CMDMDCODE\\d+\u{E000}"
@@ -246,7 +331,7 @@ class MarkdownRenderer {
         }
 
         if options.enableWikiLinks {
-            processedMarkdown = processWikiLinks(processedMarkdown, baseURL: baseURL)
+            processedMarkdown = processWikiLinks(processedMarkdown, baseURL: baseURL, codeTokens: codeTokens)
         }
         if options.enableCallouts {
             processedMarkdown = processCallouts(processedMarkdown, codeTokens: codeTokens)
@@ -260,18 +345,35 @@ class MarkdownRenderer {
 
         let document = Document(parsing: processedMarkdown)
         var htmlVisitor = HTMLVisitor(renderMermaid: options.enableMermaid, taskQueue: taskQueue)
+        if !mathTokens.isEmpty {
+            htmlVisitor.restoreMath = { [self] text in
+                restoreRegions(in: text, tokens: mathTokens, matching: Self.mathTokenPattern, transform: { $0 })
+            }
+        }
         var htmlBody = htmlVisitor.visit(document)
 
-        // Math placeholders come back as escaped literal `$...$` text; the
-        // KaTeX auto-render script picks them up from the DOM.
-        htmlBody = restoreRegions(
-            in: htmlBody,
-            tokens: mathTokens,
-            matching: Self.mathTokenPattern,
-            transform: htmlEscape
-        )
+        // The scan and this parse disagree about which items are tasks (e.g. a
+        // list swallowed by an HTML block), so no line number can be trusted:
+        // render every box read-only rather than toggle the wrong line.
+        if options.interactiveTasks, !taskQueue.isFullyConsumed {
+            var readOnlyVisitor = HTMLVisitor(renderMermaid: options.enableMermaid)
+            readOnlyVisitor.restoreMath = htmlVisitor.restoreMath
+            htmlBody = readOnlyVisitor.visit(document)
+        }
 
-        return wrapWithHTML(body: htmlBody, options: options)
+        // Math placeholders come back as escaped literal `$...$` text in a
+        // `cmdmd-math` span. KaTeX renders only those spans in-DOM, so a prose
+        // dollar sign is never handed to it.
+        htmlBody = restoreMathRegions(in: htmlBody, tokens: mathTokens)
+
+        if let roots = options.localAssetRoots {
+            htmlBody = LocalAssetURL.rewriteImageSources(in: htmlBody, baseURL: baseURL, roots: roots)
+        }
+
+        // Fresh per render: only scripts the renderer writes carry it, so the
+        // CSP admits them and nothing a note smuggles in.
+        let nonce = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+        return wrapWithHTML(body: htmlBody, options: options, nonce: nonce)
     }
 
     /// Convenience used by tests and callers that don't care about settings.
@@ -279,6 +381,29 @@ class MarkdownRenderer {
         var options = MarkdownRenderOptions()
         options.theme = theme
         return renderToHTML(markdown: markdown, baseURL: baseURL, options: options)
+    }
+
+    /// The text a heading with this content (`Related [[Project X]]`) has
+    /// its anchor slugged from: the passes and parse of `renderToHTML`, then
+    /// `headingVisibleText`, so the TOC slugs what the preview does.
+    func headingAnchorText(_ headingText: String, options: MarkdownRenderOptions) -> String {
+        var (processed, codeTokens) = maskCodeRegions("# " + headingText)
+        var mathTokens: [String: String] = [:]
+        if options.enableKaTeX {
+            (processed, mathTokens) = maskMathRegions(processed)
+        }
+        if options.enableWikiLinks {
+            processed = processTags(processWikiLinks(processed, baseURL: nil, codeTokens: codeTokens))
+        }
+        processed = restoreCodeRegions(processHighlights(processed), tokens: codeTokens)
+
+        guard let heading = Document(parsing: processed).child(at: 0) as? Heading else { return headingText }
+        return restoreRegions(
+            in: headingVisibleText(heading),
+            tokens: mathTokens,
+            matching: Self.mathTokenPattern,
+            transform: { $0 }
+        )
     }
 
     // MARK: Masking
@@ -290,11 +415,88 @@ class MarkdownRenderer {
         // Line-anchored fences (``` at the start of a line, optional indent) so a
         // stray inline ``` can't pair with a real fence and swallow content
         // between two separate code blocks.
+        let fences = Self.fencedCodePattern.matches(
+            in: markdown,
+            range: NSRange(location: 0, length: (markdown as NSString).length)
+        ).map(\.range)
+        // Indented code a fence match doesn't already cover, masked in the same
+        // pass so no token ever ends up inside another.
+        let indented = Self.indentedCodeRanges(in: markdown).filter { block in
+            !fences.contains { NSIntersectionRange($0, block).length > 0 }
+        }
         return maskRegions(
             in: markdown,
-            patterns: [Self.fencedCodePattern, Self.inlineCodePattern],
+            ranges: (fences + indented).sorted { $0.location < $1.location },
+            patterns: [Self.inlineCodePattern],
             tokenPrefix: "CMDMDCODE"
         )
+    }
+
+    /// Whole-line ranges of indented (4-space) code blocks outside block
+    /// quotes. Only the parser can tell them from indented list content, so
+    /// this parses, but only when an indented line follows a blank line or a
+    /// heading, the only places such a block can start.
+    private static func indentedCodeRanges(in markdown: String) -> [NSRange] {
+        // Byte-level pre-check, so most notes (indented only inside lists) pay
+        // no parse and no per-line strings.
+        let space = UInt8(ascii: " "), tab = UInt8(ascii: "\t"), cr = UInt8(ascii: "\r")
+        var canStartBlock = true
+        var hasCandidate = false
+        for line in markdown.utf8.split(separator: UInt8(ascii: "\n"), omittingEmptySubsequences: false) {
+            let indent = line.prefix { $0 == space || $0 == tab }
+            let content = line.dropFirst(indent.count)
+            let isBlank = content.allSatisfy { $0 == space || $0 == tab || $0 == cr }
+            // Four spaces, or a tab (tab stops are 4 columns), reach code depth.
+            if canStartBlock, !isBlank, indent.count >= 4 || indent.contains(tab) {
+                hasCandidate = true
+                break
+            }
+            canStartBlock = isBlank || content.first == UInt8(ascii: "#")
+        }
+        guard hasCandidate else { return [] }
+
+        let lines = markdown.components(separatedBy: "\n")
+        var collector = IndentedCodeCollector()
+        collector.visit(Document(parsing: markdown))
+        guard !collector.lineRanges.isEmpty else { return [] }
+
+        var lineStarts: [Int] = []
+        lineStarts.reserveCapacity(lines.count)
+        var offset = 0
+        for line in lines {
+            lineStarts.append(offset)
+            offset += line.utf16.count + 1
+        }
+
+        return collector.lineRanges.compactMap { lineRange in
+            let first = lineRange.lowerBound - 1
+            let last = min(lineRange.upperBound, lines.count) - 1
+            guard first >= 0, first <= last else { return nil }
+            // CodeBlock doesn't say how it was opened; a fenced one starts on
+            // its fence line (and is the fence pattern's job).
+            let opener = lines[first].trimmingCharacters(in: .whitespaces)
+            guard !opener.hasPrefix("```"), !opener.hasPrefix("~~~") else { return nil }
+            let end = lineStarts[last] + lines[last].utf16.count
+            return NSRange(location: lineStarts[first], length: end - lineStarts[first])
+        }
+    }
+
+    private struct IndentedCodeCollector: MarkupWalker {
+        var lineRanges: [ClosedRange<Int>] = []
+
+        // Whole quoted lines can't be masked without dropping the `>` that
+        // keeps them in the quote (or callout), so quotes are left alone.
+        mutating func visitBlockQuote(_ blockQuote: BlockQuote) {}
+
+        mutating func visitCodeBlock(_ codeBlock: CodeBlock) {
+            guard let range = codeBlock.range, range.upperBound.line >= range.lowerBound.line else { return }
+            lineRanges.append(range.lowerBound.line...range.upperBound.line)
+        }
+
+        // No code block lives inside these.
+        mutating func visitParagraph(_ paragraph: Paragraph) {}
+        mutating func visitHeading(_ heading: Heading) {}
+        mutating func visitTable(_ table: Table) {}
     }
 
     /// Masks `$$display$$` and `$inline$` math with placeholder tokens. Inline
@@ -318,6 +520,7 @@ class MarkdownRenderer {
     /// code span, making code-heavy documents progressively slower.
     private func maskRegions(
         in source: String,
+        ranges sourceRanges: [NSRange] = [],
         patterns: [NSRegularExpression],
         tokenPrefix: String
     ) -> (String, [String: String]) {
@@ -325,32 +528,40 @@ class MarkdownRenderer {
         var index = 0
         var result = source
 
-        for pattern in patterns {
-            let original = result as NSString
-            let matches = pattern.matches(
-                in: result,
-                range: NSRange(location: 0, length: original.length)
-            )
-            guard !matches.isEmpty else { continue }
+        // Swaps ordered, non-overlapping ranges of `result` for tokens.
+        func mask(_ ranges: [NSRange], in original: NSString) {
+            guard !ranges.isEmpty else { return }
 
             var masked = ""
             masked.reserveCapacity(result.utf8.count)
             var cursor = 0
 
-            for match in matches {
+            for range in ranges {
                 let token = "\u{E000}\(tokenPrefix)\(index)\u{E000}"
-                tokens[token] = original.substring(with: match.range)
+                tokens[token] = original.substring(with: range)
                 masked += original.substring(
-                    with: NSRange(location: cursor, length: match.range.location - cursor)
+                    with: NSRange(location: cursor, length: range.location - cursor)
                 )
                 masked += token
-                cursor = NSMaxRange(match.range)
+                cursor = NSMaxRange(range)
                 index += 1
             }
             masked += original.substring(
                 with: NSRange(location: cursor, length: original.length - cursor)
             )
             result = masked
+        }
+
+        // Precomputed ranges of the untouched source first, then each
+        // expression over what is left.
+        mask(sourceRanges, in: source as NSString)
+        for pattern in patterns {
+            let original = result as NSString
+            let matches = pattern.matches(
+                in: result,
+                range: NSRange(location: 0, length: original.length)
+            )
+            mask(matches.map(\.range), in: original)
         }
 
         return (result, tokens)
@@ -399,51 +610,148 @@ class MarkdownRenderer {
         return restored
     }
 
-    // MARK: Obsidian extensions
+    /// Restores math placeholders: a `cmdmd-math` span in text, but plain
+    /// escaped text when the token sits inside a tag — a link's href or an
+    /// image's src (`?$filter=a&$top=5`), where a span corrupted the URL. The
+    /// rendered body only has raw `<`/`>` as tag delimiters (text and
+    /// attribute values are escaped), so one forward scan tracks tag state.
+    private func restoreMathRegions(in source: String, tokens: [String: String]) -> String {
+        let original = source as NSString
+        let matches = Self.mathTokenPattern.matches(
+            in: source,
+            range: NSRange(location: 0, length: original.length)
+        )
+        guard !matches.isEmpty else { return source }
 
-    private func processWikiLinks(_ markdown: String, baseURL: URL?) -> String {
-        let nsString = markdown as NSString
-        let range = NSRange(location: 0, length: nsString.length)
-
-        var result = markdown
-        let matches = wikiLinkPattern.matches(in: markdown, range: range).reversed()
+        let lessThan = UInt16(UInt8(ascii: "<"))
+        let greaterThan = UInt16(UInt8(ascii: ">"))
+        var restored = ""
+        restored.reserveCapacity(source.utf8.count)
+        var cursor = 0
+        var insideTag = false
 
         for match in matches {
-            let isEmbed = nsString.substring(with: match.range(at: 1)) == "!"
-            let alias = match.range(at: 2).location != NSNotFound
-                ? nsString.substring(with: match.range(at: 2))
-                : nil
-            let target = nsString.substring(with: match.range(at: 3))
+            for index in cursor..<match.range.location {
+                let unit = original.character(at: index)
+                if unit == lessThan { insideTag = true } else if unit == greaterThan { insideTag = false }
+            }
+            restored += original.substring(
+                with: NSRange(location: cursor, length: match.range.location - cursor)
+            )
+            let token = original.substring(with: match.range)
+            if let math = tokens[token] {
+                restored += insideTag ? htmlEscape(math) : "<span class='cmdmd-math'>\(htmlEscape(math))</span>"
+            } else {
+                restored += token
+            }
+            cursor = NSMaxRange(match.range)
+        }
+        restored += original.substring(from: cursor)
+        return restored
+    }
 
-            let displayText = htmlEscape(alias ?? target)
+    // MARK: Obsidian extensions
+
+    /// Rebuilds `source` once, swapping each match of `pattern` for
+    /// `replacement(match, source as NSString)`. Matches are ordered and
+    /// non-overlapping, and their ranges index the untouched source. Replacing
+    /// them one at a time copied the whole document per match (O(n·k)).
+    private func replacingMatches(
+        of pattern: NSRegularExpression,
+        in source: String,
+        with replacement: (NSTextCheckingResult, NSString) -> String
+    ) -> String {
+        let original = source as NSString
+        let matches = pattern.matches(
+            in: source,
+            range: NSRange(location: 0, length: original.length)
+        )
+        guard !matches.isEmpty else { return source }
+
+        var result = ""
+        result.reserveCapacity(source.utf8.count)
+        var cursor = 0
+
+        for match in matches {
+            result += original.substring(
+                with: NSRange(location: cursor, length: match.range.location - cursor)
+            )
+            result += replacement(match, original)
+            cursor = NSMaxRange(match.range)
+        }
+        result += original.substring(from: cursor)
+        return result
+    }
+
+    private func processWikiLinks(_ markdown: String, baseURL: URL?, codeTokens: [String: String]) -> String {
+        replacingMatches(of: wikiLinkPattern, in: markdown) { match, nsString in
+            let isEmbed = nsString.substring(with: match.range(at: 1)) == "!"
+            var target = nsString.substring(with: match.range(at: 2))
+            // In a table the pipe is escaped (`[[Note\|alias]]`), which leaves
+            // the backslash on the target.
+            if target.hasSuffix("\\") { target.removeLast() }
+            // An empty alias (`[[Note|]]`) would leave an invisible link.
+            let alias = match.range(at: 3).location != NSNotFound
+                ? nsString.substring(with: match.range(at: 3)).trimmingCharacters(in: .whitespaces)
+                : ""
+            let label = alias.isEmpty ? nil : alias
+
+            // Element content keeps the masked text: its code placeholders are
+            // restored before the Markdown parse and render as escaped code
+            // spans. Attribute values are built from the UNMASKED text — a
+            // placeholder restored there after htmlEscape would put the code's
+            // raw quotes back into the attribute.
+            let displayText = Self.escapeForTableCell(label ?? target)
+            let rawLabel = label.map { restoreCodeRegions($0, tokens: codeTokens) }
+            let rawTarget = restoreCodeRegions(target, tokens: codeTokens)
 
             if isEmbed {
                 let imgExtensions = ["png", "jpg", "jpeg", "gif", "svg", "webp"]
-                let ext = (target as NSString).pathExtension.lowercased()
+                let ext = (rawTarget as NSString).pathExtension.lowercased()
 
                 if imgExtensions.contains(ext) {
-                    let imgPath = baseURL?.appendingPathComponent(target).path ?? target
-                    result = (result as NSString).replacingCharacters(
-                        in: match.range,
-                        with: "<img src=\"file://\(htmlEscape(imgPath))\" alt=\"\(displayText)\" class=\"embedded-image\" />"
-                    )
+                    // `|300` / `|300x200` sizes an image embed; any other
+                    // alias is its alt text.
+                    let size = label.flatMap(Self.embedSizeAttributes)
+                    let altText = Self.escapeForTableCell(size == nil ? (rawLabel ?? rawTarget) : rawTarget)
+                    let imgPath = baseURL?.appendingPathComponent(rawTarget).path ?? rawTarget
+                    return "<img src=\"file://\(htmlEscape(imgPath))\" alt=\"\(altText)\" class=\"embedded-image\"\(size ?? "") />"
                 } else {
-                    result = (result as NSString).replacingCharacters(
-                        in: match.range,
-                        with: "<span class=\"embedded-note\" data-note=\"\(htmlEscape(target))\">\(displayText)</span>"
-                    )
+                    return "<span class=\"embedded-note\" data-note=\"\(htmlEscape(rawTarget))\">\(displayText)</span>"
                 }
+            } else if target.hasPrefix("#") {
+                // `[[#Heading]]` points into this note; like Obsidian, the last
+                // `#` segment names the heading. A `#^block` id has no anchor
+                // here, so it gets an empty slug (a no-op click).
+                let heading = target.split(separator: "#").last.map(String.init) ?? ""
+                let rawHeading = rawTarget.split(separator: "#").last.map(String.init) ?? ""
+                let slug = rawHeading.hasPrefix("^") ? "" : markdownHeadingSlug(rawHeading)
+                let encoded = slug.addingPercentEncoding(withAllowedCharacters: Self.internalLinkQueryValueAllowed) ?? slug
+                let href = "cmdmd://heading?slug=\(encoded)"
+                let text = Self.escapeForTableCell(label ?? (heading.isEmpty ? target : heading))
+                return "<a href=\"\(htmlEscape(href))\" class=\"wiki-link\">\(text)</a>"
             } else {
-                let encoded = target.addingPercentEncoding(withAllowedCharacters: Self.internalLinkQueryValueAllowed) ?? target
+                let encoded = rawTarget.addingPercentEncoding(withAllowedCharacters: Self.internalLinkQueryValueAllowed) ?? rawTarget
                 let href = "cmdmd://open?note=\(encoded)"
-                result = (result as NSString).replacingCharacters(
-                    in: match.range,
-                    with: "<a href=\"\(htmlEscape(href))\" class=\"wiki-link\">\(displayText)</a>"
-                )
+                return "<a href=\"\(htmlEscape(href))\" class=\"wiki-link\">\(displayText)</a>"
             }
         }
+    }
 
-        return result
+    /// `htmlEscape` plus `|`: wiki links are rewritten before cmark splits
+    /// table rows, so a literal pipe in generated text would end the cell.
+    private static func escapeForTableCell(_ text: String) -> String {
+        htmlEscape(text).replacingOccurrences(of: "|", with: "&#124;")
+    }
+
+    /// Obsidian's image-embed size, `300` or `300x200`, as `width`/`height`
+    /// attributes; nil when the alias is anything else.
+    private static func embedSizeAttributes(_ alias: String) -> String? {
+        let parts = alias.split(separator: "x", omittingEmptySubsequences: false)
+        guard (1...2).contains(parts.count),
+              parts.allSatisfy({ !$0.isEmpty && $0.allSatisfy { ("0"..."9").contains($0) } })
+        else { return nil }
+        return " width=\"\(parts[0])\"" + (parts.count == 2 ? " height=\"\(parts[1])\"" : "")
     }
 
     private func processCallouts(_ markdown: String, codeTokens: [String: String]) -> String {
@@ -465,6 +773,10 @@ class MarkdownRenderer {
                 isExpanded: isExpanded,
                 codeTokens: codeTokens
             ))
+            // End the <div> HTML block here: without a blank line it runs on
+            // and swallows what follows the callout (e.g. a task list) as raw
+            // HTML text.
+            result.append("")
             calloutContent = []
         }
 
@@ -511,7 +823,9 @@ class MarkdownRenderer {
     private func buildCalloutHTML(type: String, title: String, content: [String], isFoldable: Bool, isExpanded: Bool, codeTokens: [String: String]) -> String {
         let icon = calloutIcon(for: type)
         let safeType = htmlEscape(type)
-        let safeTitle = htmlEscape(title)
+        // Unmask before escaping: the title lands in raw HTML, where a code
+        // placeholder restored later would re-insert the code unescaped.
+        let safeTitle = htmlEscape(restoreCodeRegions(title, tokens: codeTokens))
 
         // Render the callout body as real Markdown (bold, lists, links, code —
         // and previously-processed wiki-link HTML passes straight through).
@@ -558,62 +872,180 @@ class MarkdownRenderer {
         }
     }
 
+    /// Raw HTML tags typed in the note (`<span style="color: #3b82f6">`). The
+    /// `#tag` and `==mark==` passes leave their insides alone: a hex color
+    /// became a tag span inside the attribute and the element rendered as text.
+    private static let rawHTMLTagPattern = try! NSRegularExpression(pattern: #"</?[A-Za-z][^<>]*>"#)
+
+    private static func rawHTMLTagRanges(in markdown: String) -> [NSRange] {
+        rawHTMLTagPattern.matches(in: markdown, range: NSRange(location: 0, length: (markdown as NSString).length)).map(\.range)
+    }
+
+    /// Whether `location` falls in one of `ranges` (sorted, disjoint).
+    private static func isInside(_ location: Int, _ ranges: [NSRange]) -> Bool {
+        var low = 0, high = ranges.count - 1
+        while low <= high {
+            let mid = (low + high) / 2
+            if location < ranges[mid].location { high = mid - 1 }
+            else if location >= NSMaxRange(ranges[mid]) { low = mid + 1 }
+            else { return true }
+        }
+        return false
+    }
+
     private func processTags(_ markdown: String) -> String {
-        let nsString = markdown as NSString
-        let range = NSRange(location: 0, length: nsString.length)
-
-        var result = markdown
-        let matches = tagPattern.matches(in: markdown, range: range).reversed()
-
-        for match in matches {
+        let htmlTags = Self.rawHTMLTagRanges(in: markdown)
+        return replacingMatches(of: tagPattern, in: markdown) { match, nsString in
             let fullMatch = nsString.substring(with: match.range)
+            if Self.isInside(match.range.location, htmlTags) { return fullMatch }
             let tagName = nsString.substring(with: match.range(at: 1))
 
-            result = (result as NSString).replacingCharacters(
-                in: match.range,
-                with: "<span class=\"tag\" data-tag=\"\(htmlEscape(tagName))\">\(htmlEscape(fullMatch))</span>"
-            )
+            return "<span class=\"tag\" data-tag=\"\(htmlEscape(tagName))\">\(htmlEscape(fullMatch))</span>"
         }
-
-        return result
     }
 
     /// Obsidian `==highlight==` → `<mark>`. The inner text stays Markdown, so
     /// `==**bold** highlight==` renders nested formatting.
     private func processHighlights(_ markdown: String) -> String {
-        let nsString = markdown as NSString
-        let range = NSRange(location: 0, length: nsString.length)
-
-        var result = markdown
-        for match in markPattern.matches(in: markdown, range: range).reversed() {
+        let htmlTags = Self.rawHTMLTagRanges(in: markdown)
+        return replacingMatches(of: markPattern, in: markdown) { match, nsString in
+            if Self.isInside(match.range.location, htmlTags) { return nsString.substring(with: match.range) }
             let inner = nsString.substring(with: match.range(at: 1))
-            result = (result as NSString).replacingCharacters(
-                in: match.range,
-                with: "<mark>\(inner)</mark>"
-            )
+            return "<mark>\(inner)</mark>"
         }
-        return result
     }
 
     // MARK: Document shell
 
-    private func wrapWithHTML(body: String, options: MarkdownRenderOptions) -> String {
+    /// A pinned CDN file and its Subresource Integrity hash.
+    private struct CDNResource {
+        let url: String
+        let integrity: String?
+    }
+
+    /// Exact versions (not @11 / @0.16 ranges) so the bytes behind each hash
+    /// never move. jsdelivr answers with `Access-Control-Allow-Origin: *`,
+    /// which the CORS-mode fetch SRI needs from the file:// page. Refresh a
+    /// hash with `curl -s URL | openssl dgst -sha384 -binary | openssl base64 -A`.
+    private enum CDN {
+        static let mermaid = CDNResource(
+            url: "https://cdn.jsdelivr.net/npm/mermaid@11.17.2/dist/mermaid.min.js",
+            integrity: "sha384-EOXBFmc3gx5mb+vn0vPvvGqACToJD24hhacX5Yx+8NUUQrHIle/Qi5Bg9o3zKwW2"
+        )
+        static let katexCSS = CDNResource(
+            url: "https://cdn.jsdelivr.net/npm/katex@0.16.47/dist/katex.min.css",
+            integrity: "sha384-nH0MfJ44wi1dd7w6jinlyBgljjS8EJAh2JBoRad8a3VDw2K69vfaaqm4WnR+gXtA"
+        )
+        static let katex = CDNResource(
+            url: "https://cdn.jsdelivr.net/npm/katex@0.16.47/dist/katex.min.js",
+            integrity: "sha384-CwjPRVHTvLiMBFjEoij+QZViMV5rhTOIp7CJzl24JEqpRDA1sJFHVXXLURktbYYp"
+        )
+        static let katexMhchem = CDNResource(
+            url: "https://cdn.jsdelivr.net/npm/katex@0.16.47/dist/contrib/mhchem.min.js",
+            integrity: "sha384-fB8BH//9nBzROkMUsu/Dr35jWHIbnKesUo9rW0hfEgw8mZGnkAyBAjKX9F98OVuo"
+        )
+        static let katexAutoRender = CDNResource(
+            url: "https://cdn.jsdelivr.net/npm/katex@0.16.47/dist/contrib/auto-render.min.js",
+            integrity: "sha384-bjyGPfbij8/NDKJhSGZNP/khQVgtHUE5exjm4Ydllo42FwIgYsdLO2lXGmRBf5Mz"
+        )
+        /// npm mirror of highlight.js: immutable per version, unlike a GitHub tag.
+        static let highlightBase = "https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.12.0"
+        static let highlight = CDNResource(
+            url: "\(highlightBase)/highlight.min.js",
+            integrity: "sha384-wjfDDhOPPdjtva8vWBhWeVprSpmxisEu5aYT3q1JyACqXpdKpo3PWZTMVq24MBix"
+        )
+        /// Hashes for the themes Settings offers; a hand-edited theme name
+        /// still loads from the pinned version, just without SRI.
+        static let highlightThemeIntegrity: [String: String] = [
+            "github": "sha384-eFTL69TLRZTkNfYZOLM+G04821K1qZao/4QLJbet1pP4tcF+fdXq/9CdqAbWRl/L",
+            "github-dark": "sha384-wH75j6z1lH97ZOpMOInqhgKzFkAInZPPSPlZpYKYTOqsaizPvhQZmAtLcPKXpLyH",
+            "atom-one-dark": "sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07",
+            "atom-one-light": "sha384-w6Ujm1VWa9HYFqGc89oAPn/DWDi2gUamjNrq9DRvEYm2X3ClItg9Y9xs1ViVo5b5",
+            "monokai": "sha384-Exar9WeMELq1EieDQNh7c2ggVht9/FEoVtGG2JKgmEwcm5zOXQwPMzp3PEsPJ/zq",
+            "nord": "sha384-O/y538KpolLjYHZH8xqC17hcGWgjOw79vqDDhXNIT6Q7q3O5KVr29xbsaq9k6fSL",
+            "tokyo-night-dark": "sha384-6PRNB60loRkq5oYgj0ETV33K0YsTUlab8qtfTGXhRgW5Nz1IpzS2zwj6UmlJEnyV"
+        ]
+
+        static func highlightTheme(_ name: String) -> CDNResource {
+            CDNResource(
+                url: "\(highlightBase)/styles/\(htmlEscape(name)).min.css",
+                integrity: highlightThemeIntegrity[name]
+            )
+        }
+    }
+
+    private func scriptTag(_ resource: CDNResource, nonce: String, deferred: Bool = false) -> String {
+        "<script\(deferred ? " defer" : "") src=\"\(resource.url)\"\(integrityAttributes(resource)) nonce=\"\(nonce)\"></script>"
+    }
+
+    private func stylesheetTag(_ resource: CDNResource, media: String? = nil) -> String {
+        let mediaAttribute = media.map { " media=\"\($0)\"" } ?? ""
+        return "<link rel=\"stylesheet\"\(mediaAttribute) href=\"\(resource.url)\"\(integrityAttributes(resource))>"
+    }
+
+    /// SRI needs a CORS fetch, hence crossorigin alongside every hash.
+    private func integrityAttributes(_ resource: CDNResource) -> String {
+        resource.integrity.map { " integrity=\"\($0)\" crossorigin=\"anonymous\"" } ?? ""
+    }
+
+    /// Scripts run only with the per-render nonce (the renderer's inline ones)
+    /// or from the exact pinned CDN files this page includes — never a whole
+    /// host (jsdelivr serves any GitHub file). Note HTML can still style the
+    /// page and show images, but can't run script, frame other pages, post
+    /// forms, re-base URLs or open connections. No 'unsafe-eval': mermaid,
+    /// KaTeX and highlight.js don't need it.
+    private func contentSecurityPolicy(nonce: String, scriptURLs: [String]) -> String {
+        [
+            "default-src 'none'",
+            "script-src \((["'nonce-\(nonce)'"] + scriptURLs).joined(separator: " "))",
+            "style-src 'unsafe-inline' https:",
+            "font-src https: data:",
+            "img-src https: http: data: blob: file: \(LocalAssetURL.scheme):",
+            "media-src https: http: data: blob: file:",
+            "frame-src 'none'",
+            "object-src 'none'",
+            "base-uri 'none'",
+            "form-action 'none'",
+            "connect-src 'none'"
+        ].joined(separator: "; ")
+    }
+
+    /// Adds an app-authored script at the end of `<head>`, carrying the page's
+    /// nonce so the CSP admits it. Only the FIRST `</head>` is touched — the
+    /// renderer's own; the head holds nothing a note controls, while raw HTML
+    /// in the body may contain more, and a nonce'd script placed after note
+    /// markup could be captured by a dangling tag.
+    static func insertingHeadScript(_ script: String, into html: String) -> String {
+        guard let headEnd = html.range(of: "</head>") else { return html }
+        var nonceAttribute = ""
+        if let start = html.range(of: "'nonce-", range: html.startIndex..<headEnd.lowerBound),
+           let end = html[start.upperBound..<headEnd.lowerBound].firstIndex(of: "'") {
+            nonceAttribute = " nonce=\"\(html[start.upperBound..<end])\""
+        }
+        return html.replacingCharacters(in: headEnd, with: "<script\(nonceAttribute)>\(script)</script></head>")
+    }
+
+    private func wrapWithHTML(body: String, options: MarkdownRenderOptions, nonce: String) -> String {
         let hasMermaid = body.contains("class=\"mermaid\"")
         let hasCode = body.contains("<pre><code")
+        var scriptURLs: [String] = []
 
         // Classic UMD build (sets window.mermaid). The ESM build's `import`
         // misbehaves under WKWebView's file:// base URL, so the global build is
         // the reliable choice here. v11 still auto-renders `.mermaid` via
-        // startOnLoad.
+        // startOnLoad. securityLevel 'strict' (mermaid's default) keeps the
+        // DOMPurify pass and drops `click … call` callbacks / javascript: links
+        // that 'loose' allowed in a note's diagram.
+        if hasMermaid { scriptURLs.append(CDN.mermaid.url) }
         let mermaidScript = hasMermaid ? """
-            <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
-            <script>
+            \(scriptTag(CDN.mermaid, nonce: nonce))
+            <script nonce="\(nonce)">
                 document.addEventListener('DOMContentLoaded', function() {
                     if (typeof mermaid === 'undefined') return;
                     mermaid.initialize({
                         startOnLoad: true,
                         theme: window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'default',
-                        securityLevel: 'loose',
+                        securityLevel: 'strict',
                         fontFamily: '-apple-system, BlinkMacSystemFont, sans-serif'
                     });
                 });
@@ -636,23 +1068,40 @@ class MarkdownRenderer {
 
         // Gate KaTeX on actual math markers (like mermaid/hljs above) — loading
         // four resources plus a whole-body DOM scan on every math-free note
-        // added latency to each debounced reload. `$` survives into the body,
-        // so a contains check is a safe over-approximation.
-        let hasMath = body.contains("$") || body.contains("\\(") || body.contains("\\[")
-        let katexIncludes = (options.enableKaTeX && hasMath) ? """
-            <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16/dist/katex.min.css">
-            <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16/dist/katex.min.js"></script>
-            <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16/dist/contrib/mhchem.min.js"></script>
-            <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16/dist/contrib/auto-render.min.js"
-                onload="renderMathInElement(document.body, {delimiters: [{left: '$$', right: '$$', display: true}, {left: '\\\\[', right: '\\\\]', display: true}, {left: '\\\\(', right: '\\\\)', display: false}, {left: '$', right: '$', display: false}], throwOnError: false});"></script>
+        // added latency to each debounced reload. Every masked math region
+        // comes back as a `cmdmd-math` span, and only those spans are
+        // rendered: a prose `$` (a price) is never math.
+        let hasMath = body.contains("class='cmdmd-math'")
+        let includesKaTeX = options.enableKaTeX && hasMath
+        if includesKaTeX {
+            scriptURLs += [CDN.katex.url, CDN.katexMhchem.url, CDN.katexAutoRender.url]
+        }
+        // Deferred scripts run before DOMContentLoaded, so the nonce'd listener
+        // replaces auto-render's former onload= attribute (inline handlers are
+        // outside the CSP).
+        let katexIncludes = includesKaTeX ? """
+            \(stylesheetTag(CDN.katexCSS))
+            \(scriptTag(CDN.katex, nonce: nonce, deferred: true))
+            \(scriptTag(CDN.katexMhchem, nonce: nonce, deferred: true))
+            \(scriptTag(CDN.katexAutoRender, nonce: nonce, deferred: true))
+            <script nonce="\(nonce)">
+                document.addEventListener('DOMContentLoaded', function() {
+                    if (typeof renderMathInElement === 'undefined') return;
+                    document.querySelectorAll('.cmdmd-math').forEach(function(el) {
+                        renderMathInElement(el, {delimiters: [{left: '$$', right: '$$', display: true}, {left: '\\\\[', right: '\\\\]', display: true}, {left: '\\\\(', right: '\\\\)', display: false}, {left: '$', right: '$', display: false}], throwOnError: false});
+                    });
+                });
+            </script>
             """ : ""
 
-        let highlightIncludes = (options.enableCodeHighlight && hasCode)
-            ? hljsIncludes(theme: options.preview.codeBlockTheme)
+        let includesHighlight = options.enableCodeHighlight && hasCode
+        if includesHighlight { scriptURLs.append(CDN.highlight.url) }
+        let highlightIncludes = includesHighlight
+            ? hljsIncludes(theme: options.preview.codeBlockTheme, nonce: nonce)
             : ""
 
         let taskScript = options.interactiveTasks ? """
-            <script>
+            <script nonce="\(nonce)">
                 document.addEventListener('DOMContentLoaded', function() {
                     document.querySelectorAll('input[type="checkbox"][data-line]').forEach(function(cb) {
                         cb.addEventListener('change', function(e) {
@@ -674,6 +1123,7 @@ class MarkdownRenderer {
         <html>
         <head>
             <meta charset="UTF-8">
+            <meta http-equiv="Content-Security-Policy" content="\(contentSecurityPolicy(nonce: nonce, scriptURLs: scriptURLs))">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <meta name="color-scheme" content="light dark">
             <style>
@@ -713,25 +1163,42 @@ class MarkdownRenderer {
         // 장평 (horizontal glyph scale). CSS has no reflow-safe width property for
         // non-variable fonts, so scaleX the text blocks (tables/code/images keep
         // normal width). Only emitted when changed, so the default is a true no-op.
+        // Leaf blocks only: list, quote and callout text is all in a <p>, so
+        // scaling li/blockquote too scaled it twice (or more when nested).
+        // The width (border box, padding included) is divided by the scale, so
+        // the scaled box spans the column exactly: no overflow above 100%, no
+        // ragged gap below it.
+        let charWidth = String(format: "%.3f", p.charWidth)
         let charWidthRule = abs(p.charWidth - 1.0) > 0.001 ? """
-        .markdown-body p, .markdown-body li,
+        .markdown-body p,
         .markdown-body h1, .markdown-body h2, .markdown-body h3,
-        .markdown-body h4, .markdown-body h5, .markdown-body h6,
-        .markdown-body blockquote {
-            transform: scaleX(\(String(format: "%.3f", p.charWidth)));
+        .markdown-body h4, .markdown-body h5, .markdown-body h6 {
+            transform: scaleX(\(charWidth));
             transform-origin: left center;
+            box-sizing: border-box;
+            width: calc(100% / \(charWidth));
+        }
+        """ : ""
+
+        // Prose spacing stays out of code (where wider spaces break column
+        // alignment), math and diagrams. Only emitted when changed.
+        let spacingResetRule = abs(p.letterSpacing) > 0.0001 || abs(p.wordSpacing) > 0.0001 ? """
+        .markdown-body pre, .markdown-body code, .markdown-body .katex, .markdown-body .mermaid {
+            letter-spacing: normal;
+            word-spacing: normal;
         }
         """ : ""
 
         return """
         body {
-            font-family: \(p.fontFamily);
+            font-family: \(Self.previewFontStack(p.fontFamily));
             font-size: \(Int(p.fontSize))px;
             line-height: \(String(format: "%.2f", p.lineHeight));
             max-width: \(Int(p.maxWidth))px;
             letter-spacing: \(String(format: "%.3f", p.letterSpacing))em;
             word-spacing: \(String(format: "%.3f", p.wordSpacing))em;
         }
+        \(spacingResetRule)
         h1, h2, h3, h4, h5, h6 {
             margin-top: \(Int(p.headingMarginTop))px;
             margin-bottom: \(Int(p.headingMarginBottom))px;
@@ -743,24 +1210,35 @@ class MarkdownRenderer {
         """
     }
 
-    private func hljsIncludes(theme: String) -> String {
-        let base = "https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build"
+    /// Settings' "SF Pro Text" and "Inter" fall back to the system font, not
+    /// WebKit's generic sans-serif (Helvetica): the system font has no family
+    /// name WebKit can reach, and Inter isn't part of macOS. Stored values
+    /// are unchanged, so the picker still matches them.
+    private static func previewFontStack(_ family: String) -> String {
+        switch family {
+        case "SF Pro Text, sans-serif": return "'SF Pro Text', -apple-system, BlinkMacSystemFont, sans-serif"
+        case "Inter, sans-serif": return "Inter, -apple-system, BlinkMacSystemFont, sans-serif"
+        default: return family
+        }
+    }
+
+    private func hljsIncludes(theme: String, nonce: String) -> String {
         let styleLinks: String
         switch theme {
         case "github":
             // Auto light/dark pairing for the default theme.
             styleLinks = """
-            <link rel="stylesheet" media="(prefers-color-scheme: light)" href="\(base)/styles/github.min.css">
-            <link rel="stylesheet" media="(prefers-color-scheme: dark)" href="\(base)/styles/github-dark.min.css">
+            \(stylesheetTag(CDN.highlightTheme("github"), media: "(prefers-color-scheme: light)"))
+            \(stylesheetTag(CDN.highlightTheme("github-dark"), media: "(prefers-color-scheme: dark)"))
             """
         default:
-            styleLinks = "<link rel=\"stylesheet\" href=\"\(base)/styles/\(htmlEscape(theme)).min.css\">"
+            styleLinks = stylesheetTag(CDN.highlightTheme(theme))
         }
 
         return """
         \(styleLinks)
-        <script src="\(base)/highlight.min.js"></script>
-        <script>
+        \(scriptTag(CDN.highlight, nonce: nonce))
+        <script nonce="\(nonce)">
             document.addEventListener('DOMContentLoaded', function() {
                 if (typeof hljs === 'undefined') return;
                 document.querySelectorAll('pre code').forEach(function(el) {
@@ -892,6 +1370,9 @@ struct HTMLVisitor: MarkupVisitor {
 
     var renderMermaid: Bool
     var taskQueue: TaskLineQueue
+    /// Swaps math placeholders back for their `$…$` source. Math is masked
+    /// before the parse, so heading text still carries the placeholders.
+    var restoreMath: (String) -> String = { $0 }
     private var slugger = HeadingSlugger()
 
     init(renderMermaid: Bool = true, taskQueue: TaskLineQueue = TaskLineQueue(lines: [])) {
@@ -930,10 +1411,11 @@ struct HTMLVisitor: MarkupVisitor {
     mutating func visitHeading(_ heading: Heading) -> String {
         let level = heading.level
         let content = heading.children.map { visit($0) }.joined()
-        // Slug from the heading's plain text via the shared, Unicode-aware,
+        // Slug from the heading's visible text via the shared, Unicode-aware,
         // deduplicating slugger so non-ASCII and duplicate headings each get a
-        // usable anchor id that matches the TOC.
-        let id = slugger.slug(for: heading.plainText)
+        // usable anchor id that matches the TOC. Math is slugged from its
+        // `$…$` source, not its placeholder, as the TOC slugs it.
+        let id = slugger.slug(for: restoreMath(headingVisibleText(heading)))
         return "<h\(level) id=\"\(id)\">\(content)</h\(level)>\n"
     }
 
@@ -955,12 +1437,15 @@ struct HTMLVisitor: MarkupVisitor {
         "<code>\(htmlEscape(inlineCode.code))</code>"
     }
 
+    /// Raw HTML (the note's own, and the wiki-link/callout/tag markup the
+    /// renderer injects before parsing) passes through minus anything that
+    /// could run script — backup for the page CSP.
     mutating func visitInlineHTML(_ inlineHTML: InlineHTML) -> String {
-        inlineHTML.rawHTML
+        RawHTMLSanitizer.sanitize(inlineHTML.rawHTML)
     }
 
     mutating func visitHTMLBlock(_ html: HTMLBlock) -> String {
-        html.rawHTML
+        RawHTMLSanitizer.sanitize(html.rawHTML)
     }
 
     mutating func visitLink(_ link: Link) -> String {

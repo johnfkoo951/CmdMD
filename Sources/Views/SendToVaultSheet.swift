@@ -16,6 +16,10 @@ struct SendToVaultSheet: View {
     @State private var isSending: Bool = false
     @State private var errorMessage: String?
     @State private var availableFolders: [String] = []
+    /// The running send, so Cancel can stop a batch instead of only hiding it.
+    @State private var sendTask: Task<Void, Never>?
+    /// Files a running batch has finished, for "Sending n of N…".
+    @State private var filesDone = 0
 
     /// Batch mode is active when the sidebar queued multiple files
     /// ("Send Folder to Vault…").
@@ -44,20 +48,34 @@ struct SendToVaultSheet: View {
                     .onChange(of: selectedVault) { _, newVault in
                         if let vault = newVault {
                             targetFolder = appState.effectiveSendFolder(for: vault)
-                            loadFolders(for: vault)
                         }
                     }
 
-                    if !availableFolders.isEmpty {
-                        Picker("Folder", selection: $targetFolder) {
-                            ForEach(availableFolders, id: \.self) { folder in
-                                // Indent nested folders so the vault hierarchy reads
-                                // as a tree instead of a flat path soup.
-                                Text(indentedLabel(for: folder)).tag(folder)
+                    // Editable, so a send can also target the vault root or a
+                    // new folder (created on send), not only existing folders.
+                    LabeledContent("Folder") {
+                        HStack(spacing: 6) {
+                            TextField("Folder", text: $targetFolder, prompt: Text("Vault root"))
+                                .textFieldStyle(.roundedBorder)
+                                .labelsHidden()
+                            Menu {
+                                Button("Vault root") { targetFolder = "" }
+                                if !availableFolders.isEmpty {
+                                    Divider()
+                                    ForEach(availableFolders, id: \.self) { folder in
+                                        // Indent nested folders so the vault hierarchy reads
+                                        // as a tree instead of a flat path soup.
+                                        Button(indentedLabel(for: folder)) { targetFolder = folder }
+                                    }
+                                }
+                            } label: {
+                                Image(systemName: "folder")
                             }
+                            .menuStyle(.borderlessButton)
+                            .fixedSize()
+                            .accessibilityLabel("Choose Folder")
+                            .help("Choose an existing folder, or type a new one (created on send)")
                         }
-                    } else {
-                        TextField("Folder", text: $targetFolder)
                     }
                 }
 
@@ -76,6 +94,10 @@ struct SendToVaultSheet: View {
 
                     Toggle("Inject frontmatter", isOn: $injectFrontmatter)
                     Toggle("Add source path to frontmatter", isOn: $addSourceLink)
+                        // The source key rides on injected frontmatter; without
+                        // injection the note ships unchanged.
+                        .disabled(!injectFrontmatter)
+                        .help("Adds a source property with the original file's path. Requires Inject frontmatter.")
 
                     if !isBatch {
                         Toggle("Open in Obsidian after send", isOn: $openAfterSend)
@@ -102,7 +124,8 @@ struct SendToVaultSheet: View {
                             Text("\(appState.batchSendURLs.count) Markdown files")
                                 .font(.callout)
                             ForEach(appState.batchSendURLs.prefix(5), id: \.self) { url in
-                                Text("· \(url.lastPathComponent)")
+                                // With its subfolder, which the send keeps.
+                                Text("· \(batchLabel(for: url))")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
@@ -112,12 +135,14 @@ struct SendToVaultSheet: View {
                                     .foregroundStyle(.tertiary)
                             }
                         } else if let document = appState.currentDocument {
-                            Text("File: \(document.displayTitle).md")
+                            // Named exactly as sendToVault will name it.
+                            Text("File: \(AppState.sendFilename(for: document, template: selectedTemplate))")
                                 .font(.callout)
                         }
 
                         if let vault = selectedVault {
-                            Text("To: \(vault.displayName)/\(targetFolder)/")
+                            let folder = AppState.normalizedSendFolder(targetFolder) ?? targetFolder
+                            Text("To: \(vault.displayName)/\(folder.isEmpty ? "" : folder + "/")")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -139,14 +164,18 @@ struct SendToVaultSheet: View {
                 if isSending {
                     ProgressView()
                         .controlSize(.small)
-                    Text(isBatch ? "Sending files…" : "Sending…")
+                    Text(isBatch ? "Sending \(min(filesDone + 1, appState.batchSendURLs.count)) of \(appState.batchSendURLs.count)…" : "Sending…")
                         .font(.callout)
                         .foregroundStyle(.secondary)
+                        .monospacedDigit()
                 }
 
                 Spacer()
 
                 Button("Cancel") {
+                    // Stops a running batch after the file in progress; files
+                    // already sent stay sent, and a toast says how many.
+                    sendTask?.cancel()
                     dismiss()
                 }
                 .keyboardShortcut(.cancelAction)
@@ -171,7 +200,15 @@ struct SendToVaultSheet: View {
             if let vault = appState.defaultVault {
                 selectedVault = vault
                 targetFolder = appState.effectiveSendFolder(for: vault)
-                loadFolders(for: vault)
+            }
+        }
+        // One load per selected vault. Switching vaults cancels the previous
+        // load, so a slower list for the old vault can't replace this one's.
+        .task(id: selectedVault?.id) {
+            if let vault = selectedVault {
+                await loadFolders(for: vault)
+            } else {
+                availableFolders = []
             }
         }
     }
@@ -181,30 +218,36 @@ struct SendToVaultSheet: View {
         return String(repeating: "    ", count: depth) + (folder.components(separatedBy: "/").last ?? folder)
     }
 
-    private func loadFolders(for vault: Vault) {
-        Task {
-            let vaultService = VaultService(dataDirectory: FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!.appendingPathComponent("CmdMD"))
-            let effective = appState.effectiveSendFolder(for: vault)
-            do {
-                var folders = try await vaultService.listFolders(in: vault)
-                if !folders.contains(effective) {
-                    folders.insert(effective, at: 0)
-                }
-                await MainActor.run { availableFolders = folders }
-            } catch {
-                await MainActor.run { availableFolders = [effective] }
-            }
-        }
+    /// A batch file as the preview lists it: its path below the batch folder.
+    private func batchLabel(for url: URL) -> String {
+        let subfolder = AppState.batchTargetFolder(for: url, root: appState.batchSendRoot, base: "")
+        return subfolder.isEmpty ? url.lastPathComponent : subfolder + "/" + url.lastPathComponent
     }
 
-    private func buildOptions(vault: Vault) -> SendOptions {
+    private var selectedTemplate: VaultTemplate? {
+        applyTemplate ? appState.templates.first(where: { $0.id == selectedTemplateId }) : nil
+    }
+
+    private func loadFolders(for vault: Vault) async {
+        let vaultService = VaultService(dataDirectory: AppState.dataDirectory)
+        let effective = appState.effectiveSendFolder(for: vault)
+        var folders = (try? await vaultService.listFolders(in: vault)) ?? []
+        if !folders.contains(effective) {
+            folders.insert(effective, at: 0)
+        }
+        // Superseded by another vault's load while listing: drop it.
+        guard !Task.isCancelled, selectedVault?.id == vault.id else { return }
+        availableFolders = folders
+    }
+
+    private func buildOptions(vault: Vault, folder: String) -> SendOptions {
         var options = SendOptions()
         options.targetVault = vault
-        options.targetFolder = targetFolder
+        options.targetFolder = folder
         options.action = action
         options.conflictResolution = conflictResolution
         options.injectFrontmatter = injectFrontmatter
-        options.addSourceLink = addSourceLink
+        options.addSourceLink = addSourceLink && injectFrontmatter
         options.openAfterSend = openAfterSend && !isBatch
         options.applyTemplate = applyTemplate
         options.templateId = applyTemplate ? selectedTemplateId : nil
@@ -213,17 +256,42 @@ struct SendToVaultSheet: View {
 
     private func send() {
         guard let vault = selectedVault else { return }
+        // The folder is free text now; it must stay inside the vault.
+        guard let folder = AppState.normalizedSendFolder(targetFolder) else {
+            errorMessage = "The folder can't contain \u{201C}..\u{201D}. Use a path inside the vault."
+            return
+        }
 
         isSending = true
         errorMessage = nil
-        let options = buildOptions(vault: vault)
+        filesDone = 0
+        let options = buildOptions(vault: vault, folder: folder)
 
-        Task {
+        sendTask = Task {
             do {
                 if isBatch {
-                    _ = await appState.sendFiles(appState.batchSendURLs, options: options)
+                    let result = await appState.sendFiles(
+                        appState.batchSendURLs,
+                        options: options,
+                        relativeTo: appState.batchSendRoot,
+                        progress: { filesDone = $0 }
+                    )
+                    // Cancelled: the sheet is already gone, and touching the
+                    // queue could clobber a batch started since.
+                    if Task.isCancelled { return }
+                    if !result.failures.isEmpty {
+                        // Stay open with only the failed files queued, so the
+                        // user sees which didn't go and why, and can retry them.
+                        await MainActor.run {
+                            appState.batchSendURLs = result.failures.map { $0.url }
+                            errorMessage = failureSummary(result.failures)
+                            isSending = false
+                        }
+                        return
+                    }
                 } else {
                     try await appState.sendToVault(options: options)
+                    if Task.isCancelled { return }
                 }
 
                 await MainActor.run {
@@ -237,6 +305,15 @@ struct SendToVaultSheet: View {
                 }
             }
         }
+    }
+
+    /// Names the files a batch couldn't send, with the reason for each.
+    private func failureSummary(_ failures: [(url: URL, message: String)]) -> String {
+        let limit = 5
+        var lines = [failures.count == 1 ? "1 file couldn't be sent:" : "\(failures.count) files couldn't be sent:"]
+        lines += failures.prefix(limit).map { "\($0.url.lastPathComponent): \($0.message)" }
+        if failures.count > limit { lines.append("… and \(failures.count - limit) more") }
+        return lines.joined(separator: "\n")
     }
 }
 

@@ -65,7 +65,8 @@ struct DocumentStatsView: View {
 
     @State private var wordCount = 0
     @State private var characterCount = 0
-    @State private var hasCounted = false
+    /// The document the counts are for (nil before the first count).
+    @State private var countedID: UUID?
 
     private var readingTimeMinutes: Int {
         max(1, wordCount / 200)
@@ -103,11 +104,12 @@ struct DocumentStatsView: View {
             }
         }
         .foregroundColor(.secondary)
-        .opacity(hasCounted ? 1 : 0)
-        .task(id: document.content) {
-            // First pass (document open / tab switch) counts immediately;
-            // subsequent keystrokes wait out the debounce.
-            if hasCounted {
+        .opacity(countedID == nil ? 0 : 1)
+        .task(id: document.contentRevision) {
+            // A document newly shown (opened, or a tab switch) counts at once;
+            // typing in it waits out the debounce. A did-count flag also made
+            // a tab switch wait, showing the last note's counts meanwhile.
+            if countedID == document.id {
                 try? await Task.sleep(nanoseconds: 250_000_000)
                 guard !Task.isCancelled else { return }
             }
@@ -118,12 +120,21 @@ struct DocumentStatsView: View {
             guard !Task.isCancelled else { return }
             wordCount = counts.0
             characterCount = counts.1
-            hasCounted = true
+            countedID = document.id
         }
     }
 
+    /// Words as the system's word breaking finds them, so Japanese and
+    /// Chinese, written without spaces, count word by word, and Markdown
+    /// marks (`-`, `[ ]`, `|`, `#`, `---`) don't count. Splitting on spaces
+    /// made a Japanese paragraph one word and `- [ ] buy milk` five. Not
+    /// `.localized`, so a count doesn't depend on the user's locale.
     nonisolated static func countWords(in content: String) -> Int {
-        content.split(whereSeparator: { $0.isWhitespace || $0.isNewline }).count
+        var count = 0
+        content.enumerateSubstrings(in: content.startIndex..<content.endIndex, options: [.byWords, .substringNotRequired]) { _, _, _, _ in
+            count += 1
+        }
+        return count
     }
 }
 
@@ -190,7 +201,7 @@ struct ZoomIndicator: View {
         .buttonStyle(.plain)
         .animation(.easeOut(duration: 0.12), value: isHovering)
         .onHover { isHovering = $0 }
-        .help("Zoom level — click to reset to 100% (⌘0)")
+        .help(appState.shortcutHelp("Zoom level — click to reset to 100%", .resetZoom))
     }
 }
 
@@ -229,7 +240,7 @@ struct ViewModeIndicator: View {
         .fixedSize()
         .animation(.easeOut(duration: 0.12), value: isHovering)
         .onHover { isHovering = $0 }
-        .help("Change view mode (⌘1 / ⌘2 / ⌘3)")
+        .help(appState.shortcutHelp("Change view mode", .sourceMode, .splitMode, .previewMode))
     }
 
     private var viewModeIcon: String {

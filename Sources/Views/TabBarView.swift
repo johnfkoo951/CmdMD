@@ -1,7 +1,27 @@
 import SwiftUI
+import UniformTypeIdentifiers
+
+/// What a tab carries while it is dragged to reorder the bar. Not its UUID as
+/// a String: that is plain text, so a tab released over the editor dropped
+/// "3F2504E0-…" into the note (and onto the Desktop, a text clipping).
+struct TabDragItem: Codable, Transferable {
+    let id: UUID
+
+    /// A private type that text views, the preview and Finder don't read. A
+    /// dynamic type (from a private MIME type) rather than `exportedAs:`: AppKit
+    /// routes a drag to SwiftUI drop destinations only when its type conforms to
+    /// public.data, and an exported type the Info.plist doesn't declare
+    /// conforms to nothing, so no tab could be reordered.
+    static let contentType = UTType(mimeType: "application/x-cmdmd-tab", conformingTo: .data) ?? .data
+
+    static var transferRepresentation: some TransferRepresentation {
+        CodableRepresentation(contentType: contentType)
+    }
+}
 
 struct TabBarView: View {
     @Environment(AppState.self) private var appState
+    @State private var barWidth: CGFloat = 0
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -9,26 +29,34 @@ struct TabBarView: View {
                 HStack(spacing: 2) {
                     ForEach(appState.tabs) { tab in
                         TabItemView(tab: tab)
+                            // Natural width: the row is now offered the whole
+                            // bar (below), which would stretch every tab.
+                            .fixedSize(horizontal: true, vertical: false)
                             .id(tab.id)
                     }
 
                     NewTabButton()
 
                     // Catch-all drop zone: without it a tab could never be
-                    // dragged past the last position.
+                    // dragged past the last position. It fills the rest of the
+                    // bar (at least 24 pt once the tabs overflow) and the row's
+                    // height: a Spacer has none, so the target was 0 pt tall.
                     Spacer(minLength: 24)
-                        .frame(maxWidth: .infinity)
+                        .frame(minWidth: 24, maxWidth: .infinity, maxHeight: .infinity)
                         .contentShape(Rectangle())
-                        .dropDestination(for: String.self) { items, _ in
-                            guard let idString = items.first,
-                                  let sourceId = UUID(uuidString: idString) else { return false }
+                        .dropDestination(for: TabDragItem.self) { items, _ in
+                            guard let sourceId = items.first?.id else { return false }
                             appState.moveTabToEnd(id: sourceId)
                             return true
                         }
                 }
                 .padding(.horizontal, 6)
                 .padding(.vertical, 3)
+                // A horizontal scroll view offers its content no width, so the
+                // zone above shrank to its 24 pt minimum; make the row span the bar.
+                .frame(minWidth: barWidth, alignment: .leading)
             }
+            .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { barWidth = $0 }
             .onChange(of: appState.activeTabId) { _, newId in
                 // Keyboard tab switches must not leave the active tab offscreen.
                 guard let newId else { return }
@@ -77,6 +105,10 @@ struct TabItemView: View {
                     }
                     .buttonStyle(.plain)
                     .help("Close Tab")
+                    // VoiceOver gets the Close Tab action below instead; merged
+                    // into the tab, this hover-only button would turn activating
+                    // a tab under the pointer into closing it.
+                    .accessibilityHidden(true)
                 } else if tab.isDirty {
                     Circle()
                         .fill(CMDSBrand.develop)
@@ -129,20 +161,40 @@ struct TabItemView: View {
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(tab.displayTitle)
-        .accessibilityAddTraits(isActive ? [.isSelected] : [])
+        // The label replaces the merged children, so the dirty dot, pin and
+        // star are spoken here; the close button is hover-only, hence the action.
+        .accessibilityValue(Self.accessibilityStatus(isDirty: tab.isDirty, isPinned: tab.isPinned, isFavorited: isFavorited))
+        .accessibilityAddTraits(isActive ? [.isButton, .isSelected] : [.isButton])
+        .accessibilityAction {
+            appState.activeTabId = tab.id
+        }
+        .accessibilityAction(named: "Close Tab") {
+            closeTab(tab)
+        }
         .contextMenu {
             TabContextMenu(tab: tab)
         }
-        .draggable(tab.id.uuidString)
-        .dropDestination(for: String.self) { items, _ in
+        .draggable(TabDragItem(id: tab.id))
+        .dropDestination(for: TabDragItem.self) { items, _ in
             // Drag-to-reorder: dropping tab A onto tab B inserts A before B.
-            guard let idString = items.first, let sourceId = UUID(uuidString: idString) else { return false }
+            guard let sourceId = items.first?.id else { return false }
             appState.moveTab(id: sourceId, before: tab.id)
             return true
         }
     }
 
+    /// VoiceOver's value for a tab: the states its glyphs show, e.g. "Edited, Pinned".
+    static func accessibilityStatus(isDirty: Bool, isPinned: Bool, isFavorited: Bool) -> String {
+        [isDirty ? "Edited" : nil, isPinned ? "Pinned" : nil, isFavorited ? "Favorite" : nil]
+            .compactMap { $0 }
+            .joined(separator: ", ")
+    }
+
     private func closeTab(_ tab: EditorTab) {
+        // Commit a syllable still being composed, then re-read the dirty flag
+        // it may have set.
+        appState.commitPendingComposition()
+        let tab = appState.tabs.first(where: { $0.id == tab.id }) ?? tab
         if tab.isDirty && appState.settings.confirmBeforeClosingDirtyTabs {
             appState.closeTabWithConfirmation(tab)
         } else {
@@ -162,7 +214,7 @@ struct TabContextMenu: View {
 
     var body: some View {
         Button {
-            appState.closeTab(tab)
+            appState.closeTabsWithConfirmation([tab])
         } label: {
             Label("Close Tab", systemImage: "xmark")
         }
@@ -213,6 +265,12 @@ struct TabContextMenu: View {
 
         if let url = tab.fileURL {
             Button {
+                appState.openInObsidian(fileURL: url)
+            } label: {
+                Label("Open in Obsidian", systemImage: "arrow.up.forward.app")
+            }
+
+            Button {
                 NSWorkspace.shared.selectFile(url.path, inFileViewerRootedAtPath: url.deletingLastPathComponent().path)
             } label: {
                 Label("Reveal in Finder", systemImage: "folder")
@@ -251,6 +309,7 @@ struct NewTabButton: View {
         .onHover { isHovering = $0 }
         .contentShape(Rectangle())
         .help("New Tab (⌘T)")
+        .accessibilityLabel("New Tab")
     }
 }
 
