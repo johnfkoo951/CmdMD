@@ -2,5 +2,5 @@
 # values into the app's Info.plist; the Release workflow requires the v* tag to equal
 # CFBundleShortVersionString and CFBundleVersion to exceed the previous release's.
 # Bump both before tagging.
-CFBundleShortVersionString=1.4.8
-CFBundleVersion=14
+CFBundleShortVersionString=1.5.0
+CFBundleVersion=15
