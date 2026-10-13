@@ -372,6 +372,12 @@ final class R2SecurityTests: XCTestCase {
         // WebKit's NSURL form of a draft anchor (its `fragment` is nil).
         let draftAnchor = NSURL(string: "about:blank#x")! as URL
         XCTAssertEqual(decide(draftAnchor, .linkActivated, page: URL(string: "about:blank")!), .allow)
+        // macOS 15 spells that same anchor `about:blank%23x`.
+        XCTAssertEqual(decide(URL(string: "about:blank%23x")!, .linkActivated, page: URL(string: "about:blank")!), .allow)
+        XCTAssertEqual(decide(URL(string: "about:blank%23x")!, .other, page: URL(string: "about:blank")!), .allow)
+        // Only `about:` reads `%23` as an anchor; for files it is part of the name.
+        let encodedName = URL(fileURLWithPath: "/Users/me/notes/a#b.md")
+        XCTAssertEqual(decide(encodedName, .linkActivated), .openNote(encodedName))
         // A link to the folder itself is not an anchor.
         XCTAssertEqual(decide(page, .linkActivated), .revealInFinder(page))
     }

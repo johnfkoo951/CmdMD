@@ -489,12 +489,16 @@ final class R2EditorsyncHostedEditorTests: XCTestCase {
     }
 
     // F127 / F002: programmatic replacements leave a consistent undo stack.
+    // A real keystroke's undo group closes with its event; `spin` after
+    // `type` does the same, or (on macOS 15) the model change lands while
+    // the typing group is still open.
 
     @MainActor
     func testDiskReloadDropsUndoHistory() {
         let textView = mount("alpha beta")
         window.makeFirstResponder(textView)
         type(" TYPED", into: textView)
+        spin(0.02)
         XCTAssertEqual(textView.undoManager?.canUndo, true)
 
         NotificationCenter.default.post(name: .documentReloadedFromDisk, object: model.documentID)
@@ -505,6 +509,7 @@ final class R2EditorsyncHostedEditorTests: XCTestCase {
 
         // Shorter than what an old undo entry would address.
         type("Z", into: textView)
+        spin(0.02)
         NotificationCenter.default.post(name: .documentReloadedFromDisk, object: model.documentID)
         model.text = "short"
         waitUntil { textView.string == "short" }
@@ -544,6 +549,7 @@ final class R2EditorsyncHostedEditorTests: XCTestCase {
         let textView = mount("- [ ] task")
         window.makeFirstResponder(textView)
         type("!", into: textView)
+        spin(0.02)
         XCTAssertEqual(model.text, "- [ ] task!")
 
         model.text = "- [x] task!"  // a preview checkbox toggle

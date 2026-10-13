@@ -75,12 +75,22 @@ enum PreviewNavigationPolicy {
     /// String-based on purpose: for the NSURL WebKit hands over, `fragment`
     /// is nil on non-hierarchical URLs such as a draft's `about:blank#x`.
     static func hasFragment(_ url: URL) -> Bool {
-        url.absoluteString.contains("#")
+        anchorString(url).contains("#")
     }
 
     static func withoutFragment(_ url: URL) -> URL {
-        let string = url.absoluteString
+        let string = anchorString(url)
         guard let hash = string.firstIndex(of: "#") else { return url }
         return URL(string: String(string[..<hash])) ?? url
+    }
+
+    /// `absoluteString`, except that an `about:` URL's `%23` reads as the
+    /// fragment delimiter: macOS 15's Foundation spells a draft's
+    /// `about:blank#x` as `about:blank%23x`, even when built by CFURL from
+    /// bytes the way WebKit builds the URLs it hands over.
+    private static func anchorString(_ url: URL) -> String {
+        let string = url.absoluteString
+        guard url.scheme?.lowercased() == "about" else { return string }
+        return string.replacingOccurrences(of: "%23", with: "#")
     }
 }
