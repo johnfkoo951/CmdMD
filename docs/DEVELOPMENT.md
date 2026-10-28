@@ -141,21 +141,85 @@ local key monitor.
 GitHub Releases API (`/releases/latest`): compare `tag_name` to the running bundle
 version with a small component-wise semver compare. Silent on launch (throttled 6h),
 on-demand via the app menu / About. A status-bar badge appears for older builds.
-CmdMD isn't sandboxed (it already loads Mermaid/KaTeX over the network), so
-`URLSession` works without extra entitlements.
+CmdMD isn't sandboxed, so `URLSession` works without extra entitlements.
 
 ---
 
 ## 9. Library / CDN gotchas
 
-- **Mermaid:** use the UMD `dist/mermaid.min.js` (sets `window.mermaid`), **not**
-  the ESM build — `import` misbehaves under WKWebView's `file://` base URL.
-- **KaTeX:** `@0.16` + `mhchem` + delimiters for `\[ \]` and `\( \)` (masked in
-  `maskMathRegions`). Tests assert the substrings `highlight.min.js` / `katex` /
-  `class="mermaid"`.
+- **Bundled, not fetched:** the preview loads KaTeX, Pele and highlight.js from
+  `Resources/PreviewLibs` (+ Highlightr's bundle) over `cmdmd-lib://`
+  (`PreviewLibrarySchemeHandler`), SRI hashed from the served bytes. Only HTML export /
+  Copy as HTML use jsDelivr.
+- **Diagrams (Pele):** `Resources/PreviewLibs/cmds-pele/` is a consumer copy of the
+  cmds-pele module — refresh it with cmds-pele's `bin/pele-sync.py`, never by hand. The
+  app reads Pele's version from `cmds-pele.version.json` (the export's jsDelivr URL) and
+  hashes the files itself, so a sync needs no code change. ```` ```mermaid ```` renders as
+  `<div class="cmdmd-diagram"><pre class="mermaid">`, mounted by `cmdsPele.mountAll` after
+  first paint.
+- **KaTeX:** `@0.16.47` + `mhchem` + delimiters for `\[ \]` and `\( \)` (masked in
+  `maskMathRegions`).
 - **CI:** the pinned `swift-actions/setup-swift@5.9` **crashes `swift-frontend`**
   building Yams' module interface. `ci.yml`/`release.yml` use the macOS runner's
   native toolchain instead — do not re-pin 5.9.
+- **Diagram captions:** an italic line right after a ```` ```mermaid ```` fence is the
+  caption (`p.cmdmd-diagram-caption`; the diagram's `pre` gets `data-captioned` so Pele
+  mounts it without a figure). `%% @caption:` is used only when there is no such line —
+  cmds-pele's `catalog/SURFACES.md` rule, because the visible line is what Obsidian shows.
+
+---
+
+## 10. Typing and tab switches reloaded the whole preview
+
+**Symptom.** Every typing pause re-rendered the note on the main thread and reloaded
+the page (110–180 ms for a large note, plus KaTeX/Pele/highlight.js again); a tab
+switch did the same; keystrokes in split view cost 30–60 ms of main-thread time.
+
+**Root cause.** Three layers each did whole-document work per change: SwiftUI compared
+the bridged 500 KB `String` on every update (11–13 ms per compare), the renderer ran on
+the main thread, and the page was replaced with `loadHTMLString`.
+
+**Fix.**
+- `PreviewSource` compares length first; `updateNSView` skips only when text, settings
+  and base URL match the newest render *requested* (not the page on screen).
+- `PreviewRenderThread` (`PreviewScheduling.swift`) renders off-main on one serial thread
+  with an **8 MB stack** — a GCD worker's 512 KB stack overflows (SIGBUS) on ~600 nested
+  quotes. A newer request for the same preview replaces the waiting one.
+- `PreviewPageCache` keeps the last 6 notes' pages; a cached page gets a fresh nonce
+  (`refreshingNonce(in:)`, head only). `PreviewDebounce` waits 1.5× the last refresh,
+  clamped to 40–250 ms. `PreviewWarmup` starts WebKit when the editor window appears.
+- Live pages wrap the note in `#cmdmd-root` with a `<!--cmdmd-->` marker before each
+  top-level block (`PreviewBlocks.swift` merges ranges an element spans, e.g. `<details>`
+  or footnotes). `PreviewEdit` diffs old/new blocks byte-wise from both ends and
+  `cmdmdPreview.patch` (`PreviewRuntime.swift`) swaps only the changed run — passed as
+  a `callAsyncJavaScript` argument, parsed in a `<template>`, then highlight.js / KaTeX /
+  Pele run on the new nodes only. A nonce or block-count mismatch, a head change (first
+  code/math/diagram, new callout type) or markup that would parse differently on its own
+  falls back to a full load. Task boxes carry an ordinal (`data-task`), mapped to a line
+  by `RenderedBody.taskLines`, so Enter above a task doesn't change every later block.
+- Exports use `interactiveTasks = false`: no root, markers, runtime or task bridge.
+
+**Editor side** (`EditorTextView.swift`): the current-line band repaints only its old and
+new rects; the line index follows text-storage edits (exact during Korean marked text);
+TextKit 1's "redraw everything below the edited line" is held back for edits inside one
+line unless the line's height changes, the view scrolls, or the selection leaves the line.
+
+### Measuring
+
+All env-gated (skipped in a plain `swift test`); numbers only mean something in release
+and as interleaved A/B medians:
+
+```bash
+CMDMD_BENCH_DIR=<fixtures> swift test -c release -Xswiftc -enable-testing --filter RenderBenchmarkTests
+CMDMD_HOSTED_BENCH=1 CMDMD_BENCH_DIR=<fixtures> swift test -c release -Xswiftc -enable-testing \
+    --filter HostedTypingBenchmarkTests     # typing / tab switch / first paint, patches, WebContent CPU
+CMDMD_HOSTED_BENCH=1 CMDMD_BENCH_DIR=<fixtures> swift test -c release -Xswiftc -enable-testing \
+    --filter EditorTypingBenchmarkTests     # editor alone, CMDMD_BENCH_IME=1 for Hangul
+```
+
+`RenderBenchmarkTests` also writes every fixture's page per theme with
+`CMDMD_BENCH_OUT=<dir>`; `RenderEquivalenceDumpTests` (`CMDMD_EQ_DIRS`, `CMDMD_EQ_OUT`)
+dumps byte-exact output for proving a refactor changes nothing.
 
 ---
 

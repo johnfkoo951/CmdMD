@@ -315,7 +315,8 @@ struct PreviewSettingsView: View {
                 }
 
                 Picker("Font family", selection: $state.settings.previewSettings.fontFamily) {
-                    Text("System UI").tag("system-ui")
+                    // "system-ui" (the default) leaves each theme's own font.
+                    Text("Theme default").tag("system-ui")
                     Text("Georgia").tag("Georgia, serif")
                     Text("Times New Roman").tag("Times New Roman, serif")
                     Text(fontLabel("Inter")).tag("Inter, sans-serif")
@@ -381,10 +382,13 @@ struct PreviewSettingsView: View {
             Section("Obsidian Compatibility") {
                 Toggle("Wiki links [[...]] and #tags", isOn: $state.settings.enableWikiLinks)
                 Toggle("Callouts > [!note]", isOn: $state.settings.enableCallouts)
-                Toggle("Mermaid diagrams", isOn: $state.settings.enableMermaid)
+                Toggle("Diagrams (Mermaid syntax, drawn by Pele)", isOn: $state.settings.enableMermaid)
+                    .help("```mermaid code blocks are drawn by Pele, the renderer Obsidian uses for them")
                 Toggle("KaTeX math ($...$, $$...$$)", isOn: $state.settings.enableKaTeX)
+                Toggle("Strict line breaks", isOn: $state.settings.strictLineBreaks)
+                    .help("Off (Obsidian's default): a single newline shows as a line break. On: it joins the paragraph, as on GitHub.")
 
-                Text("Mermaid, KaTeX, and code highlighting load from a CDN — they degrade gracefully when offline.")
+                Text("Diagrams, math, and code highlighting are built into the app and work offline. Exported HTML loads them from a CDN.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

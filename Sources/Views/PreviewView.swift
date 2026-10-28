@@ -83,6 +83,23 @@ final class PreviewWebView: WKWebView {
     }
 }
 
+/// The previewed text as a view input whose equality checks the UTF-16
+/// length before the characters (`String.differs(from:)`). SwiftUI compares
+/// a view's inputs on every update, and String == walks both notes up to
+/// the edit point: 11-13 ms per keystroke for a 500 KB note from the editor.
+/// Typing changes the length, so the comparison is O(1).
+struct PreviewSource: Equatable {
+    let text: String
+
+    init(_ text: String) {
+        self.text = text
+    }
+
+    static func == (lhs: PreviewSource, rhs: PreviewSource) -> Bool {
+        !lhs.text.differs(from: rhs.text)
+    }
+}
+
 struct MarkdownPreviewView: NSViewRepresentable {
     /// Identity of the previewed document; a change means a tab switch, which
     /// renders immediately and resets scroll (vs. debounced live typing updates).
@@ -93,7 +110,7 @@ struct MarkdownPreviewView: NSViewRepresentable {
     /// (`ReadingPositions.key(for:)`). Unlike `documentID`, which every open
     /// mints anew, it survives closing the tab and relaunching.
     let positionKey: String?
-    let markdown: String
+    let source: PreviewSource
     let baseURL: URL?
     let options: MarkdownRenderOptions
     let scrollSyncEnabled: Bool
@@ -105,13 +122,17 @@ struct MarkdownPreviewView: NSViewRepresentable {
     func makeNSView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
         config.preferences.isTextInteractionEnabled = true
-        // Bridge for preview→app messages (interactive task checkboxes).
-        config.userContentController.add(context.coordinator, name: "cmdmd")
+        // Bridge for preview→app messages (task toggles, which the page
+        // hears back about, and the reading position).
+        config.userContentController.addScriptMessageHandler(context.coordinator, contentWorld: .page, name: "cmdmd")
         // Local images: a loadHTMLString page can't read file:// URLs, so the
         // renderer points them at this scheme (see LocalAssetURL).
         config.setURLSchemeHandler(context.coordinator.assetHandler, forURLScheme: LocalAssetURL.scheme)
+        // KaTeX, highlight.js and their styles from inside the app (see PreviewLibrary).
+        config.setURLSchemeHandler(PreviewLibrarySchemeHandler(), forURLScheme: PreviewLibrary.scheme)
 
         let webView = PreviewWebView(frame: .zero, configuration: config)
+        PreviewWarmup.end()
         webView.navigationDelegate = context.coordinator
         webView.pageZoom = zoom
         webView.isPaneVisible = isVisible
@@ -138,11 +159,11 @@ struct MarkdownPreviewView: NSViewRepresentable {
             source: Coordinator.scrollReportScript, injectionTime: .atDocumentStart, forMainFrameOnly: true
         ))
 
-        let html = context.coordinator.renderer.renderToHTML(markdown: markdown, baseURL: baseURL, options: options)
-        context.coordinator.lastSource = markdown
-        context.coordinator.lastOptions = options
-        context.coordinator.currentDocumentID = documentID
-        context.coordinator.loadFirstPage(html, documentID: documentID, positionKey: positionKey, baseURL: baseURL)
+        // The first page (a relaunch, the first note after the welcome
+        // screen) opens at its remembered position, as a tab switch does.
+        context.coordinator.switchDocument(
+            to: documentID, positionKey: positionKey, markdown: source.text, baseURL: baseURL, options: options
+        )
 
         return webView
     }
@@ -163,19 +184,26 @@ struct MarkdownPreviewView: NSViewRepresentable {
         // review-first flow of flipping between long notes.
         if context.coordinator.currentDocumentID != documentID {
             context.coordinator.switchDocument(
-                to: documentID, positionKey: positionKey, markdown: markdown, baseURL: baseURL, options: options
+                to: documentID, positionKey: positionKey, markdown: source.text, baseURL: baseURL, options: options
             )
             return
         }
         // Same document, new path (renamed or moved): file its position there.
         context.coordinator.updatePositionKey(positionKey, for: documentID)
 
-        guard context.coordinator.lastSource.differs(from: markdown) || context.coordinator.lastOptions != options else {
+        // Against the newest render asked for, not the page on screen: an
+        // update carrying the text already rendering (a zoom step, a mode
+        // switch) would otherwise start it over. The folder counts too: Save
+        // As, a move or a rename keeps the text, and the page must resolve
+        // its images and links against the new folder.
+        let coordinator = context.coordinator
+        guard coordinator.latestSource.differs(from: source.text) || coordinator.latestOptions != options
+                || coordinator.latestBaseURL != baseURL else {
             return
         }
         // Debounced + scroll-preserving: rendering happens inside the debounce so
         // fast typing doesn't pay a full markdown→HTML pass per keystroke.
-        context.coordinator.scheduleRender(markdown: markdown, baseURL: baseURL, options: options)
+        context.coordinator.scheduleRender(markdown: source.text, baseURL: baseURL, options: options)
     }
 
     static func dismantleNSView(_ nsView: WKWebView, coordinator: Coordinator) {
@@ -187,13 +215,38 @@ struct MarkdownPreviewView: NSViewRepresentable {
         Coordinator()
     }
 
-    class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
+    class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandlerWithReply {
         weak var webView: WKWebView?
         let renderer = MarkdownRenderer()
-        var lastSource: String = ""
-        var lastOptions: MarkdownRenderOptions?
         var scrollSyncEnabled: Bool = true
         var currentDocumentID: UUID?
+        /// The newest text and settings handed to a render (or shown): what
+        /// the preview is showing or about to.
+        private(set) var latestSource = ""
+        private(set) var latestOptions = MarkdownRenderOptions()
+        private(set) var latestBaseURL: URL?
+
+        /// Bumped for every page about to be rendered or shown.
+        private var generation = 0
+        /// Where the current document's reading position is filed.
+        private var currentPositionKey: String?
+        /// The page on screen (or loading): the one loaded, or the last
+        /// one patched in. Task toggles check their line against its text.
+        /// Its baseURL (nil → about:blank): its own load and #anchor jumps
+        /// are the only navigations allowed without a click, and its folder
+        /// and asset roots are where local images may come from.
+        private var page: PreviewPage?
+        /// The loaded page's nonce, and how many patches it has taken since:
+        /// what the page names in a task toggle, and a patch must name.
+        private var pageNonce = ""
+        private var pageVersion = 0
+        /// The page a patch in flight brings, and the newest one rendered
+        /// meanwhile, shown once it lands.
+        private var patching: PreviewPage?
+        private var nextPage: PreviewPage?
+        private var pageCache = PreviewPageCache()
+        private var debounce = PreviewDebounce()
+        private var loadStartedAt: UInt64 = 0
 
         private var pendingScrollY: Double = 0
         /// The document whose page is loaded (or loading), and the key its
@@ -212,17 +265,13 @@ struct MarkdownPreviewView: NSViewRepresentable {
         private var pendingHeadingSlug: String?
         private var renderDebounce: DispatchWorkItem?
         private var observers: [NSObjectProtocol] = []
-        /// baseURL of the page last loaded (nil → about:blank). Its own load
-        /// and #anchor jumps are the only navigations allowed without a click,
-        /// and its folder is where local images may come from.
-        private var pageBaseURL: URL?
         let assetHandler = LocalAssetSchemeHandler()
 
         override init() {
             super.init()
             assetHandler.allowedRoots = { [weak self] in
                 guard let self else { return [] }
-                return [self.pageBaseURL].compactMap { $0 } + (self.lastOptions?.localAssetRoots ?? [])
+                return [self.page?.baseURL].compactMap { $0 } + (self.page?.options.localAssetRoots ?? [])
             }
             let center = NotificationCenter.default
             observers.append(center.addObserver(
@@ -283,23 +332,41 @@ struct MarkdownPreviewView: NSViewRepresentable {
             observers.forEach { NotificationCenter.default.removeObserver($0) }
             observers = []
             renderDebounce?.cancel()
+            PreviewRenderThread.shared.cancel(for: self)
         }
 
-        /// Tab switch: capture the outgoing document's scroll offset, then
-        /// immediately (no debounce) render the incoming one at its remembered
-        /// position (or the top on first visit).
+        /// Tab switch, or the first page: capture the outgoing document's
+        /// scroll offset, then at once (no debounce) show the incoming one at
+        /// its remembered position (or the top on first visit) — from the
+        /// cache when its text and settings are unchanged, rendered otherwise.
         func switchDocument(to documentID: UUID?, positionKey: String?, markdown: String, baseURL: URL?, options: MarkdownRenderOptions) {
             currentDocumentID = documentID
+            currentPositionKey = positionKey
+            setLatest(markdown, baseURL: baseURL, options: options)
             renderDebounce?.cancel()
+            // The outgoing note's: a patch in flight still lands on its page.
+            nextPage = nil
             guard let webView else { return }
 
-            let render = { [weak self] in
-                guard let self, self.currentDocumentID == documentID, let webView = self.webView else { return }
-                let html = self.renderer.renderToHTML(markdown: markdown, baseURL: baseURL, options: options)
-                self.lastSource = markdown
-                self.lastOptions = options
-                self.pendingScrollY = self.beginDisplaying(documentID, positionKey: positionKey)
-                self.load(html, into: webView, baseURL: baseURL)
+            // The newest text when the offset comes back: typing may have
+            // asked for a render meanwhile, or even put the page up already.
+            let open = { [weak self] in
+                guard let self, self.currentDocumentID == documentID else { return }
+                // Up already: typed in, or back before the other note's page came.
+                if self.displayedDocumentID == documentID, let page = self.patching ?? self.page,
+                   page.matches(self.latestSource, baseURL: self.latestBaseURL, options: self.latestOptions) {
+                    PreviewRenderThread.shared.cancel(for: self)
+                    return
+                }
+                // Newer than any render asked for before, which can't replace it.
+                self.generation += 1
+                if let cached = self.pageCache.page(for: documentID, source: self.latestSource, baseURL: self.latestBaseURL,
+                                                    options: self.latestOptions, generation: self.generation) {
+                    PreviewRenderThread.shared.cancel(for: self)
+                    self.show(cached)
+                } else {
+                    self.render(self.latestSource, baseURL: self.latestBaseURL, options: self.latestOptions, for: documentID)
+                }
             }
 
             // Filed under the page actually on screen: keyed by the outgoing
@@ -308,26 +375,25 @@ struct MarkdownPreviewView: NSViewRepresentable {
             if let outgoingKey = displayedKey, loadingNavigation == nil {
                 webView.evaluateJavaScript("window.scrollY") { value, _ in
                     if let y = value as? Double { AppState.shared?.recordReadingPosition(y, forKey: outgoingKey) }
-                    render()
+                    open()
                 }
             } else {
-                render()
+                open()
             }
-        }
-
-        /// First page of a new preview (a relaunch, the first document after
-        /// the welcome screen), opened at its remembered position too.
-        func loadFirstPage(_ html: String, documentID: UUID?, positionKey: String?, baseURL: URL?) {
-            guard let webView else { return }
-            pendingScrollY = beginDisplaying(documentID, positionKey: positionKey)
-            load(html, into: webView, baseURL: baseURL)
         }
 
         /// A renamed or moved file keeps its document but changes key: once
         /// its page is the one on screen, file the position under the new key.
         func updatePositionKey(_ positionKey: String?, for documentID: UUID?) {
+            currentPositionKey = positionKey
             guard displayedDocumentID == documentID, displayedKey != positionKey else { return }
             displayedKey = positionKey
+        }
+
+        private func setLatest(_ markdown: String, baseURL: URL?, options: MarkdownRenderOptions) {
+            latestSource = markdown
+            latestBaseURL = baseURL
+            latestOptions = options
         }
 
         /// Marks `documentID`'s page as the one on screen and returns its
@@ -339,49 +405,168 @@ struct MarkdownPreviewView: NSViewRepresentable {
         }
 
         /// Debounces preview rebuilds and restores the prior scroll offset, so
-        /// typing in split view doesn't jump the preview to the top.
+        /// typing in split view doesn't jump the preview to the top. The wait
+        /// follows what the last refresh of this preview cost.
         func scheduleRender(markdown: String, baseURL: URL?, options: MarkdownRenderOptions) {
             renderDebounce?.cancel()
-            // Capture the document this render belongs to. A DispatchWorkItem that
-            // has already begun executing can't be cancelled, and its async
-            // evaluateJavaScript completion can fire after a tab switch — so both
-            // the work item and the completion re-check the id and bail if the
-            // document changed, preventing the old note from clobbering the new one.
-            let docID = currentDocumentID
+            setLatest(markdown, baseURL: baseURL, options: options)
+            // A work item that has begun can't be cancelled, and the render
+            // and offset read after it finish later still: each step re-checks
+            // the document, so the old note never clobbers the new one.
+            let documentID = currentDocumentID
             let work = DispatchWorkItem { [weak self] in
-                guard let self, self.currentDocumentID == docID, let webView = self.webView else { return }
-                let html = self.renderer.renderToHTML(markdown: markdown, baseURL: baseURL, options: options)
-                self.lastSource = markdown
-                self.lastOptions = options
-                webView.evaluateJavaScript("window.scrollY") { [weak self] value, _ in
-                    guard let self, self.currentDocumentID == docID, let webView = self.webView else { return }
-                    self.pendingScrollY = (value as? Double) ?? 0
-                    self.load(html, into: webView, baseURL: baseURL)
-                }
+                guard let self, self.currentDocumentID == documentID else { return }
+                self.render(markdown, baseURL: baseURL, options: options, for: documentID)
             }
             renderDebounce = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
+            DispatchQueue.main.asyncAfter(deadline: .now() + debounce.delay, execute: work)
         }
 
-        /// Loads HTML with the pending scroll offset injected so restoration
+        /// Renders on the render thread and shows the page back on the main
+        /// thread, unless the tab changed or a newer page was shown meanwhile.
+        /// A render still waiting when the next is asked for never runs (see
+        /// PreviewRenderThread).
+        private func render(_ markdown: String, baseURL: URL?, options: MarkdownRenderOptions, for documentID: UUID?) {
+            generation += 1
+            let generation = generation
+            let renderer = renderer
+            PreviewRenderThread.shared.enqueue(for: self) { [weak self] in
+                let start = DispatchTime.now().uptimeNanoseconds
+                let rendered = renderer.renderPage(markdown: markdown, baseURL: baseURL, options: options)
+                let renderMs = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.currentDocumentID == documentID else { return }
+                    self.show(PreviewPage(rendered: rendered, source: markdown, baseURL: baseURL, options: options, generation: generation, renderMs: renderMs))
+                }
+            }
+        }
+
+        /// The newest page shown, being patched in, or waiting for that.
+        private var newestGeneration: Int {
+            max(page?.generation ?? 0, patching?.generation ?? 0, nextPage?.generation ?? 0)
+        }
+
+        /// Puts a page of the current document up: its first one opens at
+        /// the remembered position — whichever render brings it, since typing
+        /// right after a switch supersedes the switch's own — and the next
+        /// ones patch the changed blocks into the page on screen, or reload
+        /// keeping its offset.
+        private func show(_ page: PreviewPage) {
+            guard let webView, page.generation > newestGeneration else { return }
+            if displayedDocumentID != currentDocumentID {
+                pendingScrollY = beginDisplaying(currentDocumentID, positionKey: currentPositionKey)
+                load(page, into: webView)
+            } else if patching != nil {
+                // One patch at a time: each is computed against the page it lands on.
+                nextPage = page
+            } else if loadingNavigation != nil {
+                // Mid-load, the page on screen is not yet at its offset: the
+                // new one takes over the offset that load was restoring.
+                load(page, into: webView)
+            } else if let current = self.page, let edit = PreviewEdit(from: current, to: page) {
+                apply(edit, bringing: page, into: webView)
+            } else {
+                reload(page, into: webView)
+            }
+        }
+
+        /// A load of the page at the offset on screen.
+        private func reload(_ page: PreviewPage, into webView: WKWebView) {
+            let documentID = currentDocumentID
+            webView.evaluateJavaScript("window.scrollY") { [weak self] value, _ in
+                guard let self, self.currentDocumentID == documentID,
+                      page.generation > self.newestGeneration, let webView = self.webView else { return }
+                self.pendingScrollY = (value as? Double) ?? 0
+                self.load(page, into: webView)
+            }
+        }
+
+        /// Patches the changed blocks into the page on screen. Until the
+        /// page answers, the page on screen is still the old one: its task
+        /// lines, its blocks for the next edit. A page that refuses (it is
+        /// not the one this was computed against) reloads.
+        private func apply(_ edit: PreviewEdit, bringing page: PreviewPage, into webView: WKWebView) {
+            guard !edit.isEmpty else { return settle(page, version: pageVersion) }
+            patching = page
+            let started = DispatchTime.now().uptimeNanoseconds
+            webView.callAsyncJavaScript(
+                "return window.cmdmdPreview.patch(edit);", arguments: ["edit": edit.argument(forPage: pageNonce)], in: nil, in: .page
+            ) { [weak self] result in
+                // A load since (a tab switch) replaced the page.
+                guard let self, self.patching?.generation == page.generation else { return }
+                self.patching = nil
+                if case .success(let value) = result, let reply = value as? [String: Any],
+                   reply["done"] as? Bool == true, let version = reply["version"] as? Int {
+                    // Render + patch pace the typing debounce, as render + load did.
+                    if let renderMs = page.renderMs {
+                        self.debounce.record(refreshMs: renderMs + Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000)
+                    }
+                    self.settle(page, version: version)
+                } else if let webView = self.webView {
+                    let newest = self.nextPage ?? page
+                    self.nextPage = nil
+                    self.reload(newest, into: webView)
+                }
+            }
+        }
+
+        /// The patched page is on screen: then the page that came meanwhile,
+        /// or the heading jump that waited.
+        private func settle(_ page: PreviewPage, version: Int) {
+            self.page = page
+            pageVersion = version
+            if page.renderMs != nil { pageCache.store(page, for: displayedDocumentID) }
+            if let next = nextPage {
+                nextPage = nil
+                show(next)
+            } else if let slug = pendingHeadingSlug, displayedDocumentID == currentDocumentID {
+                pendingHeadingSlug = nil
+                runHeadingScroll(slug)
+            }
+        }
+
+        /// Loads the page with the pending scroll offset injected so restoration
         /// happens at DOMContentLoaded — before first paint. The didFinish
         /// fallback stays for slow subresource layouts, but the top-of-page
         /// flash per re-render is gone.
-        func load(_ html: String, into webView: WKWebView, baseURL: URL?) {
-            var html = html
+        private func load(_ page: PreviewPage, into webView: WKWebView) {
+            self.page = page
+            pageNonce = page.rendered.nonce
+            pageVersion = 0
+            // A patch in flight lands on the page this replaces: dropped.
+            patching = nil
+            nextPage = nil
+            if page.renderMs != nil { pageCache.store(page, for: displayedDocumentID) }
+            var html = page.html
             if pendingScrollY > 0, pendingHeadingSlug == nil {
                 // Nonce'd so the page CSP runs it; lands in the renderer's head only.
+                // Diagrams draw after the text (and after didFinish): until then
+                // the page can be too short for the offset, and swapping a
+                // source for its drawing moves it, so it is set again once
+                // they are in.
                 html = MarkdownRenderer.insertingHeadScript(
-                    "addEventListener('DOMContentLoaded',function(){window.scrollTo(0,\(pendingScrollY));});",
+                    "addEventListener('DOMContentLoaded',function(){var y=\(pendingScrollY);window.scrollTo(0,y);"
+                        + "if(window.cmdmdDiagrams)window.cmdmdDiagrams.then(function(){window.scrollTo(0,y);});});",
                     into: html
                 )
             }
-            pageBaseURL = baseURL
-            loadingNavigation = webView.loadHTMLString(html, baseURL: baseURL)
+            loadStartedAt = DispatchTime.now().uptimeNanoseconds
+            loadingNavigation = webView.loadHTMLString(html, baseURL: page.baseURL)
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-            if navigation === loadingNavigation { loadingNavigation = nil }
+            if navigation === loadingNavigation {
+                loadingNavigation = nil
+                // A rendered page's whole refresh paces the typing debounce:
+                // up to its diagrams drawn, as one sooner would redraw them.
+                if let page, let renderMs = page.renderMs {
+                    let started = loadStartedAt
+                    webView.callAsyncJavaScript("await window.cmdmdDiagrams; return true;", arguments: [:], in: nil, in: .page) { [weak self] _ in
+                        guard let self, self.page?.generation == page.generation else { return }
+                        self.debounce.record(refreshMs: renderMs + Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000)
+                    }
+                }
+            }
             if let slug = pendingHeadingSlug, loadingNavigation == nil, displayedDocumentID == currentDocumentID {
                 pendingHeadingSlug = nil
                 pendingScrollY = 0
@@ -402,9 +587,10 @@ struct MarkdownPreviewView: NSViewRepresentable {
 
         private func scrollToHeadingSlug(_ slug: String) {
             // [[Note#Heading]] and search hits fire a fixed delay after the read:
-            // on a page still loading (or not yet swapped in) the jump was lost,
-            // or the restored reading position overrode it.
-            if loadingNavigation != nil || displayedDocumentID != currentDocumentID {
+            // on a page still loading or being patched (or not yet swapped
+            // in) the jump was lost, or the restored reading position
+            // overrode it.
+            if loadingNavigation != nil || patching != nil || displayedDocumentID != currentDocumentID {
                 pendingHeadingSlug = slug
                 pendingScrollY = 0
                 return
@@ -414,18 +600,25 @@ struct MarkdownPreviewView: NSViewRepresentable {
 
         private func runHeadingScroll(_ slug: String) {
             let escaped = slug.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "'", with: "\\'")
+            // Once the diagrams are in: drawing them moves what is below. The
+            // DOM's own methods, never a note element's property (see
+            // PreviewRuntime).
             let js = """
             (function() {
-                var el = document.getElementById('\(escaped)');
-                if (el) {
-                    el.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                }
+                Promise.resolve(window.cmdmdDiagrams).then(function() {
+                    var el = Document.prototype.getElementById.call(document, '\(escaped)');
+                    if (el) {
+                        Element.prototype.scrollIntoView.call(el, { behavior: 'smooth', block: 'start' });
+                    }
+                });
             })();
             """
             webView?.evaluateJavaScript(js, completionHandler: nil)
         }
 
         private func scrollToFraction(_ fraction: Double) {
+            // The editor's offset is the current note's, not the outgoing page's.
+            guard displayedDocumentID == currentDocumentID else { return }
             let js = "window.scrollTo(0, \(fraction) * (document.documentElement.scrollHeight - window.innerHeight));"
             webView?.evaluateJavaScript(js, completionHandler: nil)
         }
@@ -494,33 +687,47 @@ struct MarkdownPreviewView: NSViewRepresentable {
 
         // MARK: Preview → app messages
 
-        func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage,
+                                   replyHandler: @escaping (Any?, String?) -> Void) {
             // Handlers are exposed to every frame; only the rendered page itself
             // may edit the document.
             guard message.name == "cmdmd",
                   message.frameInfo.isMainFrame,
                   let body = message.body as? [String: Any],
-                  let type = body["type"] as? String else { return }
+                  let type = body["type"] as? String else { return replyHandler(nil, nil) }
 
-            // Only the active note's own, settled page may edit it: during a tab
-            // switch the outgoing page stays clickable until the new one loads,
-            // and a click there flipped the same line of the new note.
-            if type == "toggleTask",
-               let line = body["line"] as? Int,
-               loadingNavigation == nil, displayedDocumentID == currentDocumentID {
-                let checked = body["checked"] as? Bool ?? true
-                let rendered = lastSource.components(separatedBy: "\n")
-                let expected = line >= 1 && line <= rendered.count ? rendered[line - 1] : nil
-                AppState.shared?.toggleTask(atLine: line, checked: checked, expectedLine: expected)
+            if type == "toggleTask" {
+                return replyHandler(toggleTask(body), nil)
             }
 
             // Reading position from scrollReportScript. While a page loads, a
-            // report can still come from the page it replaces: dropped.
-            if type == "scroll", message.frameInfo.isMainFrame,
-               let y = body["y"] as? Double,
-               loadingNavigation == nil, let key = displayedKey {
+            // report can still come from the page it replaces: dropped. So is
+            // one from the outgoing page while the incoming one renders: its
+            // offset was taken at the switch. A patch keeps the page, and the
+            // reader's place on it.
+            if type == "scroll", let y = body["y"] as? Double,
+               loadingNavigation == nil, displayedDocumentID == currentDocumentID, let key = displayedKey {
                 AppState.shared?.recordReadingPosition(y, forKey: key)
             }
+            replyHandler(nil, nil)
+        }
+
+        /// Only the active note's own, settled page may edit it: during a tab
+        /// switch the outgoing page stays clickable until the new one loads,
+        /// and a click there flipped the same line of the new note. The box
+        /// names its page and patch, whose task lines map it to a line of the
+        /// page's text; AppState maps that through any edit since, and the
+        /// line must still read as rendered.
+        private func toggleTask(_ body: [String: Any]) -> Bool {
+            guard let ordinal = body["task"] as? Int, let page,
+                  body["page"] as? String == pageNonce, body["version"] as? Int == pageVersion,
+                  loadingNavigation == nil, displayedDocumentID == currentDocumentID,
+                  page.rendered.taskLines.indices.contains(ordinal) else { return false }
+            let line = page.rendered.taskLines[ordinal]
+            let rendered = page.source.components(separatedBy: "\n")
+            let expected = line >= 1 && line <= rendered.count ? rendered[line - 1] : nil
+            return AppState.shared?.toggleTask(atLine: line, checked: body["checked"] as? Bool ?? true,
+                                               expectedLine: expected, renderedSource: page.source) ?? false
         }
 
         /// Posts `window.scrollY` once scrolling settles for 300 ms. Passive,
@@ -546,7 +753,7 @@ struct MarkdownPreviewView: NSViewRepresentable {
                 url: navigationAction.request.url,
                 navigationType: navigationAction.navigationType,
                 isMainFrame: navigationAction.targetFrame?.isMainFrame ?? true,
-                pageURL: PreviewNavigationPolicy.pageURL(forBaseURL: pageBaseURL)
+                pageURL: PreviewNavigationPolicy.pageURL(forBaseURL: page?.baseURL)
             )
 
             switch decision {

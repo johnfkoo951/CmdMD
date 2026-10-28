@@ -17,49 +17,113 @@ extension Notification.Name {
 
 /// Caches newline offsets (UTF-16) so line numbers, caret position, and
 /// scroll-to-line are O(log n) lookups instead of rescanning the document.
+///
+/// Kept current from the text storage's edits (`applyEdit`), not rebuilt
+/// per keystroke: a rebuild copied and scanned the whole text, 0.2 ms a key
+/// on a 200K-character note. An edit rescans only its own characters, and
+/// the offsets after it move by a pending shift instead of being rewritten:
+/// typing in one place costs a binary search, and moving to another line
+/// settles the shift for the lines in between only.
 final class LineIndex {
-    private(set) var newlinePositions: [Int] = []
-    /// Reused scan buffer — rebuilding runs on every keystroke, so a fresh
-    /// 2×docSize allocation per keypress is real steady-state garbage.
+    /// Newline offsets; those at `shiftStart` and after are stored `shift`
+    /// units short of their real value.
+    private var offsets: [Int] = []
+    private var shiftStart = 0
+    private var shift = 0
+    /// Reused scan buffer: a full rebuild (document load, tab switch) would
+    /// otherwise allocate twice the document's size each time.
     private var buffer: [unichar] = []
 
-    func rebuild(from text: NSString) {
-        let length = text.length
-        guard length > 0 else {
-            newlinePositions = []
-            return
-        }
-        if buffer.count < length {
-            buffer = [unichar](repeating: 0, count: length)
-        }
-        text.getCharacters(&buffer, range: NSRange(location: 0, length: length))
-        var positions: [Int] = []
-        for i in 0..<length where buffer[i] == 0x0A {
-            positions.append(i)
-        }
-        newlinePositions = positions
+    /// The real offsets, in order.
+    var newlinePositions: [Int] {
+        settleShift(upTo: offsets.count)
+        return offsets
     }
 
-    var lineCount: Int { newlinePositions.count + 1 }
+    func rebuild(from text: NSString) {
+        offsets = newlines(in: text, range: NSRange(location: 0, length: text.length))
+        shiftStart = offsets.count
+        shift = 0
+    }
+
+    /// Follows one storage edit: `editedRange` holds the new characters (in
+    /// the new text), which replaced `editedRange.length - changeInLength`
+    /// old ones at the same location. NSTextStorage reports an edit group
+    /// the same way, so a batch of edits applies as one.
+    func applyEdit(in text: NSString, editedRange: NSRange, changeInLength delta: Int) {
+        let oldEnd = NSMaxRange(editedRange) - delta
+        let first = firstIndex(atOrAfter: editedRange.location)
+        let afterRemoved = firstIndex(atOrAfter: oldEnd)
+        // Offsets past the edit move by delta: settle the pending shift up
+        // to where they start, then fold delta into it.
+        settleShift(upTo: afterRemoved)
+        let inserted = newlines(in: text, range: editedRange)
+        if inserted.isEmpty && first == afterRemoved {
+            // Typing within a line: no newline added or removed.
+        } else {
+            offsets.replaceSubrange(first..<afterRemoved, with: inserted)
+        }
+        shiftStart = first + inserted.count
+        shift += delta
+    }
+
+    var lineCount: Int { offsets.count + 1 }
 
     /// 1-based line number containing the given UTF-16 location.
     func lineNumber(at location: Int) -> Int {
-        var low = 0, high = newlinePositions.count
-        while low < high {
-            let mid = (low + high) / 2
-            if newlinePositions[mid] < location { low = mid + 1 } else { high = mid }
-        }
-        return low + 1
+        firstIndex(atOrAfter: location) + 1
     }
 
     /// UTF-16 offset where the given 1-based line starts.
     func startLocation(ofLine line: Int) -> Int {
         guard line > 1 else { return 0 }
         let index = line - 2
-        guard index < newlinePositions.count else {
-            return newlinePositions.last.map { $0 + 1 } ?? 0
+        guard index < offsets.count else {
+            return offsets.isEmpty ? 0 : offset(at: offsets.count - 1) + 1
         }
-        return newlinePositions[index] + 1
+        return offset(at: index) + 1
+    }
+
+    private func offset(at index: Int) -> Int {
+        index >= shiftStart ? offsets[index] + shift : offsets[index]
+    }
+
+    /// Index of the first newline at or after `location`.
+    private func firstIndex(atOrAfter location: Int) -> Int {
+        var low = 0, high = offsets.count
+        while low < high {
+            let mid = (low + high) / 2
+            if offset(at: mid) < location { low = mid + 1 } else { high = mid }
+        }
+        return low
+    }
+
+    /// Moves the start of the pending shift to `index`, rewriting only the
+    /// offsets between the old start and the new one.
+    private func settleShift(upTo index: Int) {
+        guard shift != 0 else {
+            shiftStart = index
+            return
+        }
+        if index > shiftStart {
+            for i in shiftStart..<index { offsets[i] += shift }
+        } else if index < shiftStart {
+            for i in index..<shiftStart { offsets[i] -= shift }
+        }
+        shiftStart = index
+    }
+
+    private func newlines(in text: NSString, range: NSRange) -> [Int] {
+        guard range.length > 0, NSMaxRange(range) <= text.length else { return [] }
+        if buffer.count < range.length {
+            buffer = [unichar](repeating: 0, count: range.length)
+        }
+        text.getCharacters(&buffer, range: range)
+        var positions: [Int] = []
+        for i in 0..<range.length where buffer[i] == 0x0A {
+            positions.append(range.location + i)
+        }
+        return positions
     }
 
     func lineAndColumn(at location: Int) -> (line: Int, column: Int) {
@@ -237,10 +301,20 @@ final class CmdMDTextView: NSTextView {
     override func drawBackground(in rect: NSRect) {
         super.drawBackground(in: rect)
 
-        guard highlightCurrentLine,
-              selectedRange().length == 0,
-              let layoutManager, let textContainer else { return }
+        guard highlightCurrentLine, selectedRange().length == 0,
+              let lineRect = caretLineRect() else { return }
+        paintedBandRect = lineRect
 
+        guard rect.intersects(lineRect) else { return }
+        currentLineColor.setFill()
+        lineRect.fill()
+    }
+
+    /// The current-line band: the caret's whole logical line (every
+    /// fragment of a wrapped one), full width, in view coordinates. Nil
+    /// without a layout manager.
+    func caretLineRect() -> NSRect? {
+        guard let layoutManager, let textContainer else { return nil }
         let caret = selectedRange().location
         let ns = string as NSString
 
@@ -261,11 +335,27 @@ final class CmdMDTextView: NSTextView {
         lineRect.origin.x = 0
         lineRect.origin.y += textContainerInset.height
         lineRect.size.width = bounds.width
-        paintedBandRect = lineRect
+        return lineRect
+    }
 
-        guard rect.intersects(lineRect) else { return }
-        currentLineColor.setFill()
-        lineRect.fill()
+    /// Repaints the band after a caret move or an edit: where it was painted
+    /// and where the caret's line is now. `needsDisplay = true` dirtied the
+    /// whole document-height bounds, and NSTextView, asked to display a
+    /// rect, first lays out every glyph under it (TextKit 1 fills all layout
+    /// holes up to the rect's bottom): the whole document after the edit
+    /// point was laid out again, and the visible page redrawn, per keystroke.
+    /// `avoidAdditionalLayout` repaints what is laid out and asks for nothing
+    /// more; the caret's own line is laid out already (it was just edited or
+    /// moved into, and caretLineRect measured it).
+    ///
+    /// Typing that leaves the band where it is repaints nothing here: the
+    /// edit's own repaint draws the band under the fragments it dirties.
+    /// Repainting the band anyway redrew every line of the caret's
+    /// paragraph, a few lines of prose or a whole wrapped table row, per key.
+    func repaintCurrentLineBand() {
+        guard let band = caretLineRect(), band != paintedBandRect else { return }
+        if let painted = paintedBandRect { setNeedsDisplay(painted, avoidAdditionalLayout: true) }
+        setNeedsDisplay(band, avoidAdditionalLayout: true)
     }
 
     /// Repaints the last band without it once the caret becomes a selection:
@@ -274,7 +364,268 @@ final class CmdMDTextView: NSTextView {
     func erasePaintedBand() {
         guard let band = paintedBandRect else { return }
         paintedBandRect = nil
-        setNeedsDisplay(band)
+        setNeedsDisplay(band, avoidAdditionalLayout: true)
+    }
+
+    // MARK: Repainting below an edited line
+
+    /// An edit inside one line that adds or removes no line break. What lies
+    /// below that line moves only if the line's laid-out height changes.
+    private struct LineEdit {
+        /// The edited line, terminator included; edits inside it never
+        /// move its start.
+        let lineStart: Int
+        var lineEnd: Int { didSet { widestLineEnd = max(widestLineEnd, lineEnd) } }
+        /// The longest the line has been during the hold.
+        private(set) var widestLineEnd: Int
+        /// Its line break's length (0 on a last line without one); edits
+        /// inside the line never touch it.
+        let terminatorLength: Int
+        /// The line's top and bottom before the edit, in view coordinates.
+        let top: CGFloat
+        let bottom: CGFloat
+        /// A scroll or resize since then (typing on the last visible line
+        /// scrolls) has its own repaints, which must not be dropped.
+        let visibleRect: NSRect
+        let size: NSSize
+
+        init(line: NSRange, terminatorLength: Int, top: CGFloat, bottom: CGFloat, visibleRect: NSRect, size: NSSize) {
+            lineStart = line.location
+            lineEnd = NSMaxRange(line)
+            widestLineEnd = lineEnd
+            self.terminatorLength = terminatorLength
+            self.top = top
+            self.bottom = bottom
+            self.visibleRect = visibleRect
+            self.size = size
+        }
+
+        /// Whether every range lies in the line's text, its line break left
+        /// out (a selection taking it in reaches the next line). NSTextView
+        /// hands setSelectedRanges the old selection unadjusted for the edit
+        /// just made (after Backspace at the line's end it is one past the
+        /// new end), so that one is measured against the longest the line
+        /// has been.
+        func contains(_ ranges: [NSValue], measuredWidest: Bool = false) -> Bool {
+            let end = (measuredWidest ? widestLineEnd : lineEnd) - terminatorLength
+            return ranges.allSatisfy {
+                let range = $0.rangeValue
+                return range.location >= lineStart && NSMaxRange(range) <= end
+            }
+        }
+    }
+
+    /// Set from shouldChangeText until the next draw (or an edit it doesn't
+    /// describe), while repaints below the line are held back.
+    private var lineEdit: LineEdit?
+    /// The storage edit shouldChangeText announced, not seen yet.
+    private var expectedEdit: (location: Int, changeInLength: Int)?
+    /// Repaints held back below the edited line.
+    private var heldRepaint: NSRect?
+    /// An announced edit went into the storage during the hold.
+    private var holdCoversEdit = false
+    /// The storage changed since the last draw, outside a hold. TextKit
+    /// gathers its pending repaints into one range from the first edited
+    /// line on, so after another edit (a highlight pass, Enter further
+    /// down) a repaint starting in the next edited line can't be told
+    /// apart: nothing is held until the view has drawn.
+    private var storageEditedSinceDraw = true
+
+    /// Called once lines below an edited line moved (it wrapped onto
+    /// another line, or unwrapped one), after their repaint is let through.
+    var onLinesBelowEditMoved: (() -> Void)?
+
+    /// Tests watch what the view marks for redraw through this: AppKit
+    /// exposes the dirty region only while drawing.
+    var onInvalidate: ((NSRect) -> Void)?
+
+    /// Whether repaints below an edited line are being held back.
+    var isHoldingRepaintsBelowEdit: Bool { lineEdit != nil }
+
+    /// When the text ends with a line break, as files do, TextKit 1 answers
+    /// every edit by marking for redraw everything from the edited line to
+    /// the end of the document (the text after it may have moved; it
+    /// re-validates that layout later). The view then redrew every visible
+    /// line below the caret, half a page of glyphs per keystroke, although
+    /// for typing inside a line nothing there moved unless the line's height
+    /// changed. That repaint is held back here and let through at the next
+    /// draw only if the line's bottom moved.
+    override func shouldChangeText(in affectedCharRange: NSRange, replacementString: String?) -> Bool {
+        let allowed = super.shouldChangeText(in: affectedCharRange, replacementString: replacementString)
+        if allowed {
+            beginLineEdit(affectedCharRange, replacement: replacementString)
+        } else {
+            releaseHeldRepaint()
+        }
+        return allowed
+    }
+
+    /// Several ranges at once (a multi-caret or column edit) aren't one line.
+    override func shouldChangeText(inRanges affectedRanges: [NSValue], replacementStrings: [String]?) -> Bool {
+        if affectedRanges.count > 1 { releaseHeldRepaint() }
+        return super.shouldChangeText(inRanges: affectedRanges, replacementStrings: replacementStrings)
+    }
+
+    private static let lineBreaks = CharacterSet(charactersIn: "\n\r\u{2028}\u{2029}\u{85}")
+
+    private func beginLineEdit(_ range: NSRange, replacement: String?) {
+        let ns = string as NSString
+        guard let replacement, NSMaxRange(range) <= ns.length,
+              (replacement as NSString).rangeOfCharacter(from: Self.lineBreaks).location == NSNotFound,
+              ns.rangeOfCharacter(from: Self.lineBreaks, options: [], range: range).location == NSNotFound
+        else {
+            releaseHeldRepaint()
+            return
+        }
+        let delta = (replacement as NSString).length - range.length
+        var start = 0, end = 0, contentsEnd = 0
+        ns.getLineStart(&start, end: &end, contentsEnd: &contentsEnd, for: NSRange(location: range.location, length: 0))
+        let line = NSRange(location: start, length: end - start)
+        if let lineEdit, lineEdit.lineStart == line.location {
+            // More typing on the line before a draw: the geometry to compare
+            // with is still the one from before the first of these edits.
+            expectedEdit = (range.location, delta)
+            return
+        }
+        releaseHeldRepaint()
+        guard !storageEditedSinceDraw, let extent = laidOutExtent(ofLineAt: line) else { return }
+        lineEdit = LineEdit(line: line, terminatorLength: end - contentsEnd, top: extent.top, bottom: extent.bottom,
+                            visibleRect: visibleRect, size: bounds.size)
+        expectedEdit = (range.location, delta)
+    }
+
+    /// Top and bottom of a line's fragments, only if it is laid out: this
+    /// runs before every edit and must not lay anything out.
+    private func laidOutExtent(ofLineAt line: NSRange) -> (top: CGFloat, bottom: CGFloat)? {
+        guard line.length > 0, let layoutManager,
+              layoutManager.firstUnlaidCharacterIndex() >= NSMaxRange(line) else { return nil }
+        let glyphs = layoutManager.glyphRange(forCharacterRange: line, actualCharacterRange: nil)
+        guard glyphs.length > 0 else { return nil }
+        let first = layoutManager.lineFragmentRect(forGlyphAt: glyphs.location, effectiveRange: nil, withoutAdditionalLayout: true)
+        let last = layoutManager.lineFragmentRect(forGlyphAt: NSMaxRange(glyphs) - 1, effectiveRange: nil, withoutAdditionalLayout: true)
+        guard !first.isEmpty, !last.isEmpty else { return nil }
+        let inset = textContainerInset.height
+        return (first.minY + inset, last.maxY + inset)
+    }
+
+    /// Every storage edit passes here (the editor's coordinator forwards
+    /// them). The one shouldChangeText announced is expected — NSTextStorage
+    /// may report it widened to its line, once attributes are fixed — and so
+    /// are attribute changes inside the line (the marked-text underline),
+    /// which can only change the line's own height. Any other edit — a
+    /// highlight pass, a programmatic replace, undo — lets the held repaint
+    /// through and holds nothing more.
+    func noteStorageEdit(_ storage: NSTextStorage) {
+        guard var lineEdit else {
+            storageEditedSinceDraw = true
+            return
+        }
+        let edited = storage.editedRange, delta = storage.changeInLength
+        let insideLine = edited.location >= lineEdit.lineStart && NSMaxRange(edited) <= lineEdit.lineEnd + delta
+        if storage.editedMask.contains(.editedCharacters) {
+            if let expected = expectedEdit, insideLine, delta == expected.changeInLength,
+               edited.location <= expected.location {
+                expectedEdit = nil
+                holdCoversEdit = true
+                lineEdit.lineEnd += delta
+                self.lineEdit = lineEdit
+                return
+            }
+        } else if insideLine {
+            return
+        }
+        releaseHeldRepaint()
+        storageEditedSinceDraw = true
+    }
+
+    /// A selection change repaints the old selection and the new one. The
+    /// caret moves typing makes stay on the edited line, but Shift-Down or
+    /// Select All before the draw (keys queued behind a slow keystroke, or
+    /// a key repeat, land in one run-loop pass) repaints from that line down
+    /// too, and so does an edit inside the line that collapses a selection
+    /// over the lines below. Held, that repaint was dropped at the draw:
+    /// those lines showed unselected (or still selected) until the next
+    /// selection change, while Delete or Copy acted on what really was. A
+    /// selection reaching off the line, old or new, lets the hold go first,
+    /// so its repaint goes through as it is.
+    override func setSelectedRanges(_ ranges: [NSValue], affinity: NSSelectionAffinity, stillSelecting: Bool) {
+        if let lineEdit, !lineEdit.contains(selectedRanges, measuredWidest: true) || !lineEdit.contains(ranges) {
+            releaseHeldRepaint()
+        }
+        super.setSelectedRanges(ranges, affinity: affinity, stillSelecting: stillSelecting)
+    }
+
+    override func setNeedsDisplay(_ rect: NSRect, avoidAdditionalLayout flag: Bool) {
+        // From inside the edited line to below it: the part below waits.
+        if let lineEdit, rect.minY >= lineEdit.top - 0.5, rect.minY < lineEdit.bottom,
+           rect.maxY > lineEdit.bottom + 0.5, rect.maxY.isFinite {
+            let below = NSRect(x: rect.minX, y: lineEdit.bottom, width: rect.width, height: rect.maxY - lineEdit.bottom)
+            heldRepaint = heldRepaint.map { $0.union(below) } ?? below
+            invalidate(NSRect(x: rect.minX, y: rect.minY, width: rect.width, height: lineEdit.bottom - rect.minY), avoidAdditionalLayout: flag)
+            return
+        }
+        invalidate(rect, avoidAdditionalLayout: flag)
+    }
+
+    private func invalidate(_ rect: NSRect, avoidAdditionalLayout flag: Bool) {
+        onInvalidate?(rect)
+        super.setNeedsDisplay(rect, avoidAdditionalLayout: flag)
+    }
+
+    override func viewWillDraw() {
+        settleLineEdit()
+        storageEditedSinceDraw = false
+        super.viewWillDraw()
+    }
+
+    /// Ends the hold before the draw: the held repaint is dropped when the
+    /// edited line kept its bottom (nothing below it moved), and let
+    /// through otherwise.
+    func settleLineEdit() {
+        guard let lineEdit else { return }
+        let held = heldRepaint, coveredEdit = holdCoversEdit
+        self.lineEdit = nil
+        expectedEdit = nil
+        holdCoversEdit = false
+        heldRepaint = nil
+        guard held != nil || coveredEdit else { return }
+        let ns = string as NSString
+        if visibleRect == lineEdit.visibleRect, bounds.size == lineEdit.size,
+           lineEdit.lineStart < ns.length,
+           let bottom = layOutLineBottom(at: ns.lineRange(for: NSRange(location: lineEdit.lineStart, length: 0))),
+           abs(bottom - lineEdit.bottom) < 0.5 {
+            return
+        }
+        // (With nothing held, TextKit's repaint is still to come and goes
+        // through as it is; the gutter still needs telling.)
+        if let held { invalidate(held, avoidAdditionalLayout: true) }
+        onLinesBelowEditMoved?()
+    }
+
+    /// The line's bottom after the edit, laying it out (the draw is about
+    /// to): the lines before it are laid out already.
+    private func layOutLineBottom(at line: NSRange) -> CGFloat? {
+        guard line.length > 0, let layoutManager else { return nil }
+        let glyphs = layoutManager.glyphRange(forCharacterRange: line, actualCharacterRange: nil)
+        guard glyphs.length > 0 else { return nil }
+        let last = layoutManager.lineFragmentRect(forGlyphAt: NSMaxRange(glyphs) - 1, effectiveRange: nil)
+        return last.isEmpty ? nil : last.maxY + textContainerInset.height
+    }
+
+    /// Lets a held repaint through now and stops holding. Lines below may
+    /// have moved for all this knows once an edit went in.
+    func releaseHeldRepaint() {
+        let coveredEdit = holdCoversEdit
+        lineEdit = nil
+        expectedEdit = nil
+        holdCoversEdit = false
+        if let held = heldRepaint {
+            heldRepaint = nil
+            invalidate(held, avoidAdditionalLayout: true)
+        } else if !coveredEdit {
+            return
+        }
+        onLinesBelowEditMoved?()
     }
 
     /// Gated here, not in acceptsFirstResponder: makeFirstResponder and the
@@ -304,7 +655,8 @@ final class CmdMDTextView: NSTextView {
 /// nothing for offscreen lines.
 final class LineNumberRulerView: NSRulerView {
     private weak var textView: NSTextView?
-    private let lineIndex: LineIndex
+    /// The editor's index, shared: the gutter numbers what it counts.
+    let lineIndex: LineIndex
 
     var numberColor: NSColor = .secondaryLabelColor { didSet { needsDisplay = true } }
     /// The caret's line number is emphasized (Xcode-style) with this color.
@@ -339,8 +691,15 @@ final class LineNumberRulerView: NSRulerView {
         fatalError("init(coder:) is not supported")
     }
 
+    /// The digit count and font the thickness was measured for.
+    private var measuredFor: (digits: Int, font: NSFont)?
+
+    /// Runs per keystroke: measures only when the line count gains or
+    /// loses a digit, or the font changed.
     func refreshThickness() {
         let digits = max(2, String(lineIndex.lineCount).count)
+        if let measuredFor, measuredFor.digits == digits, measuredFor.font == numberFont { return }
+        measuredFor = (digits, numberFont)
         let charWidth = ("8" as NSString).size(withAttributes: [.font: numberFont]).width
         let needed = ceil(CGFloat(digits) * charWidth) + 20
         if abs(needed - ruleThickness) > 0.5 {
@@ -671,6 +1030,11 @@ struct MarkdownTextEditor: NSViewRepresentable {
         context.coordinator.rulerView = ruler
         applyRulerTheme(ruler)
         ruler.refreshThickness()
+        // Typing inside a line leaves the gutter alone, unless the line
+        // wrapped differently and moved the numbers below it.
+        textView.onLinesBelowEditMoved = { [weak ruler] in
+            ruler?.needsDisplay = true
+        }
 
         // Scroll-sync + ruler redraw on scroll.
         scrollView.contentView.postsBoundsChangedNotifications = true
@@ -736,8 +1100,8 @@ struct MarkdownTextEditor: NSViewRepresentable {
             context.coordinator.dismissCompletion()
             // Base attributes for an empty document; text inherits its own.
             applyTypingAttributes(to: textView)
+            // The line index follows the storage edit.
             context.coordinator.replaceAllText(with: text)
-            context.coordinator.lineIndex.rebuild(from: text as NSString)
             context.coordinator.rulerView?.refreshThickness()
             context.coordinator.applyHighlightingNow()
             textView.undoManager?.removeAllActions()
@@ -838,6 +1202,8 @@ struct MarkdownTextEditor: NSViewRepresentable {
         private let completionPopup = CompletionWindowController()
         private var activeCompletionContext: CompletionContext?
         private var lastSentScrollFraction: Double = -1
+        /// The line number the gutter last emphasized (0: a selection).
+        private var rulerCaretLine = -1
 
         init(_ parent: MarkdownTextEditor) {
             self.parent = parent
@@ -905,19 +1271,36 @@ struct MarkdownTextEditor: NSViewRepresentable {
             })
         }
 
-        /// Records every storage edit the highlighter didn't make, so a typing
+        /// Follows every storage edit: the line index moves with the text
+        /// (typing, paste, undo, IME marked text, a model text swap), the
+        /// text view learns whether the edit is the one it was told about,
+        /// and an edit the highlighter didn't make is recorded so a typing
         /// pause restyles only the lines edited since the last pass.
         func observeEdits(of textView: NSTextView) {
             guard let storage = textView.textStorage else { return }
             // queue: nil delivers inside processEditing, while editedRange and
-            // changeInLength still describe this edit.
+            // changeInLength still describe this edit, and before the layout
+            // manager hears of it (nothing here may change the layout).
             observers.append(NotificationCenter.default.addObserver(
                 forName: NSTextStorage.didProcessEditingNotification,
                 object: storage,
                 queue: nil
             ) { [weak self] note in
-                guard let self, !self.isApplyingHighlights,
-                      let storage = note.object as? NSTextStorage else { return }
+                guard let self, let storage = note.object as? NSTextStorage else { return }
+                let editsCharacters = storage.editedMask.contains(.editedCharacters)
+                if editsCharacters {
+                    self.lineIndex.applyEdit(in: storage.mutableString, editedRange: storage.editedRange,
+                                             changeInLength: storage.changeInLength)
+                }
+                self.textView?.noteStorageEdit(storage)
+                // Typing inside a line moves no line number (the text view
+                // reports a wrap change); any other text edit may. Only
+                // marked here: a wider gutter would resize the text view
+                // mid-edit, so its width follows in textDidChange.
+                if editsCharacters, self.textView?.isHoldingRepaintsBelowEdit != true {
+                    self.rulerView?.needsDisplay = true
+                }
+                guard !self.isApplyingHighlights else { return }
                 self.pendingHighlightRange = SyntaxHighlighter.union(
                     pending: self.pendingHighlightRange,
                     edited: storage.editedRange,
@@ -1072,11 +1455,11 @@ struct MarkdownTextEditor: NSViewRepresentable {
                 textView.breakUndoCoalescing()
             }
             lastPushedText = text
-            lineIndex.rebuild(from: newText)
+            // The line index followed the storage edit.
             rulerView?.refreshThickness()
             rulerView?.needsDisplay = true
             applyHighlightingNow()
-            // The caret moved with the edit while the index was stale.
+            // The caret moved with the edit.
             reportSelection(of: textView)
         }
 
@@ -1238,10 +1621,10 @@ struct MarkdownTextEditor: NSViewRepresentable {
             lastPushedText = newText
             parent.text = newText
 
-            lineIndex.rebuild(from: newText as NSString)
+            // The line index followed the storage edit, and the gutter was
+            // marked for redraw if a number moved; it widens once the line
+            // count gains a digit.
             rulerView?.refreshThickness()
-            rulerView?.needsDisplay = true
-
             reportSelection(of: textView)
             updateCompletion(in: textView)
             scheduleHighlighting(for: textView)
@@ -1251,18 +1634,24 @@ struct MarkdownTextEditor: NSViewRepresentable {
             guard let textView = notification.object as? NSTextView else { return }
             reportSelection(of: textView)
             // Repaint for the current-line highlight — but only when the feature
-            // can actually draw something. Unconditional needsDisplay forced a
-            // full glyph redraw on every caret move and throughout drag-selection.
-            // A new selection erases just the band last painted.
+            // can actually draw something, and only the band's old and new
+            // rects. A new selection erases just the band last painted.
             if let cmdTextView = textView as? CmdMDTextView {
                 if cmdTextView.selectedRange().length > 0 {
                     cmdTextView.erasePaintedBand()
                 } else if cmdTextView.highlightCurrentLine {
-                    cmdTextView.needsDisplay = true
+                    cmdTextView.repaintCurrentLineBand()
                 }
             }
-            // The gutter emphasizes the caret's line number.
-            rulerView?.needsDisplay = true
+            // The gutter emphasizes the caret's line number: repainted when
+            // another line holds the caret (or none, for a selection). Edits
+            // repaint it from the storage observer.
+            let selection = textView.selectedRange()
+            let caretLine = selection.length == 0 ? lineIndex.lineNumber(at: selection.location) : 0
+            if caretLine != rulerCaretLine {
+                rulerCaretLine = caretLine
+                rulerView?.needsDisplay = true
+            }
 
             if completionPopup.isVisible {
                 let sel = textView.selectedRange()

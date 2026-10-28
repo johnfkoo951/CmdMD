@@ -9,9 +9,11 @@ final class ExportService {
     private var activePDFExporters: [ObjectIdentifier: PDFExporter] = [:]
 
     func exportToHTML(document: MarkdownDocument, options: MarkdownRenderOptions) -> String {
-        // Image sources stay note-relative so the file works outside the app.
+        // Image sources stay note-relative and libraries come from the CDN, so
+        // the file works outside the app (nothing else serves cmdmd-lib://).
         var exportOptions = options
         exportOptions.localAssetRoots = nil
+        exportOptions.libraries = .cdn
         return renderExport(document: document, options: exportOptions)
     }
 
@@ -52,9 +54,13 @@ final class ExportService {
         guard panel.runModal() == .OK, let url = panel.url else { return }
 
         // Local images keep the asset scheme here: the offscreen view, like the
-        // preview, has no file:// access.
+        // preview, has no file:// access. It serves the bundled libraries too,
+        // and prints when the page reports itself drawn.
         let baseURL = document.fileURL?.deletingLastPathComponent()
-        let html = renderExport(document: document, options: options)
+        var pdfOptions = options
+        pdfOptions.libraries = .bundled
+        pdfOptions.reportsRendered = true
+        let html = renderExport(document: document, options: pdfOptions)
         let exporter = PDFExporter(
             html: html,
             baseURL: baseURL,
@@ -86,10 +92,35 @@ final class ExportService {
     }
 }
 
+/// When an export prints: once the page has loaded and has reported itself
+/// drawn (highlighting, math, diagrams), or when the wait for that report
+/// times out after the load. Only once.
+struct PrintGate {
+    enum Event { case loaded, rendered, timedOut }
+
+    private var loaded = false
+    private var rendered = false
+    private var opened = false
+
+    /// True for the event that makes the page ready, and never again.
+    mutating func shouldPrint(after event: Event) -> Bool {
+        switch event {
+        case .loaded: loaded = true
+        case .rendered: rendered = true
+        // Prints what has drawn: a diagram stuck loading must not hold up the PDF.
+        case .timedOut: rendered = true
+        }
+        guard loaded, rendered, !opened else { return false }
+        opened = true
+        return true
+    }
+}
+
 /// Renders HTML in an offscreen WebView and prints it to a paginated PDF on
 /// the default paper size. Waits for the actual page load (the old fixed 0.5s
-/// sleep truncated slow documents) plus a grace period for CDN-loaded extras.
-final class PDFExporter: NSObject, WKNavigationDelegate {
+/// sleep truncated slow documents) and for the page's report that it is
+/// drawn (the fixed grace period after the load cut off slow diagrams).
+final class PDFExporter: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
     private let webView: WKWebView
     /// Never shown. NSPrintOperation only paginates a WKWebView when run
     /// modally for a window — a plain `run()` deadlocks.
@@ -97,12 +128,14 @@ final class PDFExporter: NSObject, WKNavigationDelegate {
     private let html: String
     private let baseURL: URL?
     private let completion: (Result<Data, Error>, PDFExporter) -> Void
-    private var printing = false
+    private var gate = PrintGate()
     private var finished = false
     /// Temporary file the print operation saves to.
     private var outputURL: URL?
     private static let pageWidth: CGFloat = 800
     private static let margin: CGFloat = 36
+    /// How long after the load to wait for the page's report.
+    private static let renderedTimeout: TimeInterval = 3
 
     init(html: String, baseURL: URL?, assetRoots: [URL], completion: @escaping (Result<Data, Error>, PDFExporter) -> Void) {
         self.webView = Self.makeWebView(assetRoots: assetRoots)
@@ -119,20 +152,23 @@ final class PDFExporter: NSObject, WKNavigationDelegate {
         window.isReleasedWhenClosed = false
         window.contentView = webView
         webView.navigationDelegate = self
+        // This view's own handler (not the preview's): the page's rendered report.
+        webView.configuration.userContentController.add(self, name: MarkdownRenderer.renderedMessage)
     }
 
     /// The export view: local images through the asset scheme (no file://
-    /// access here either), backgrounds printed, and pinned to the light
-    /// appearance — a windowless WKWebView otherwise takes
-    /// prefers-color-scheme from the system, so Dark Mode exported dark pages
-    /// with light ink. Set before loading so mermaid's matchMedia check at
-    /// DOMContentLoaded sees light too.
+    /// access here either), the app's own libraries through theirs,
+    /// backgrounds printed, and pinned to the light appearance — a windowless
+    /// WKWebView otherwise takes prefers-color-scheme from the system, so Dark
+    /// Mode exported dark pages with light ink. Set before loading so the
+    /// page's first style pass already sees light.
     static func makeWebView(assetRoots: [URL]) -> WKWebView {
         let config = WKWebViewConfiguration()
         config.setURLSchemeHandler(
             LocalAssetSchemeHandler(allowedRoots: { assetRoots }),
             forURLScheme: LocalAssetURL.scheme
         )
+        config.setURLSchemeHandler(PreviewLibrarySchemeHandler(), forURLScheme: PreviewLibrary.scheme)
         config.preferences.shouldPrintBackgrounds = true
         let webView = WKWebView(frame: NSRect(x: 0, y: 0, width: pageWidth, height: 1000), configuration: config)
         webView.appearance = NSAppearance(named: .aqua)
@@ -156,11 +192,22 @@ final class PDFExporter: NSObject, WKNavigationDelegate {
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        guard !printing else { return }
-        printing = true
-        // Grace period for CDN-loaded extras (syntax highlighting, math,
-        // diagrams) to settle before printing.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+        advance(.loaded)
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.renderedTimeout) { [weak self] in
+            self?.advance(.timedOut)
+        }
+    }
+
+    /// Only the export page itself reports; frames can't run script here anyway.
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard message.name == MarkdownRenderer.renderedMessage, message.frameInfo.isMainFrame else { return }
+        advance(.rendered)
+    }
+
+    private func advance(_ event: PrintGate.Event) {
+        guard gate.shouldPrint(after: event) else { return }
+        // Out of WebKit's callback before the modal print run.
+        DispatchQueue.main.async { [weak self] in
             self?.printToPDF()
         }
     }
@@ -213,6 +260,8 @@ final class PDFExporter: NSObject, WKNavigationDelegate {
     private func finish(_ result: Result<Data, Error>) {
         guard !finished else { return }
         finished = true
+        // The content controller holds its handler strongly.
+        webView.configuration.userContentController.removeScriptMessageHandler(forName: MarkdownRenderer.renderedMessage)
         completion(result, self)
     }
 }

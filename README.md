@@ -51,7 +51,11 @@ then file it into the correct vault folder with templates and rules.
 - **Review‑first** — launches into a rendered preview; `⌘1`/`⌘2`/`⌘3` flips Source / Split / Preview.
 - **Full Markdown** — GitHub‑Flavored (tables, task lists, strikethrough) plus Obsidian
   extensions: `[[wiki‑links]]`, `#tags`, `> [!callouts]`, `==highlights==`.
-- **Mermaid 11 + KaTeX** — diagrams and math (`$…$`, `$$…$$`, `\[…\]`, `\(…\)`) with `\ce{}` chemistry.
+- **Diagrams + KaTeX** — Mermaid‑syntax diagrams drawn by [Pele](https://github.com/obsidianmd/pele)
+  (the renderer Obsidian uses), themed to match the preview, and math (`$…$`, `$$…$$`, `\[…\]`, `\(…\)`)
+  with `\ce{}` chemistry.
+- **Offline preview** — diagrams, math and code highlighting ship inside the app; the preview
+  makes no network requests. Only exported HTML loads them from a CDN.
 - **7 preview themes** — CMDS, GitHub, Obsidian, Minimal, Sepia, Newsprint, Dark Pro — plus
   syntax‑highlighted source themes that follow light / dark.
 - **Obsidian vault router** — auto‑detects your installed vaults, sends notes to any folder,
@@ -130,7 +134,8 @@ connect). When you **Send** (`⇧⌘T`), a note is copied or moved into a destin
 
 Swift / SwiftUI · [swift‑markdown](https://github.com/apple/swift-markdown) ·
 [Highlightr](https://github.com/raspu/Highlightr) · [Yams](https://github.com/jpsim/Yams) ·
-Mermaid & KaTeX via CDN. App data lives in `~/Library/Application Support/CmdMD/`.
+[Pele](https://github.com/obsidianmd/pele) (via cmds-pele) · KaTeX · highlight.js, all bundled
+(see `Resources/PreviewLibs/LICENSES.md`). App data lives in `~/Library/Application Support/CmdMD/`.
 The `cmdmd://open?note=<name>` URL scheme resolves a note against the open folder and vaults.
 
 ## License

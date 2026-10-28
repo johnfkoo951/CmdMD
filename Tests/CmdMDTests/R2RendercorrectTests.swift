@@ -1,11 +1,15 @@
 import XCTest
 @testable import CmdMD
 
-final class R2RendercorrectTests: XCTestCase {
+final class R2RendercorrectTests: CheckoutLibrariesTestCase {
     private func render(_ markdown: String, configure: (inout MarkdownRenderOptions) -> Void = { _ in }) -> String {
         var options = MarkdownRenderOptions()
         configure(&options)
         return MarkdownRenderer().renderToHTML(markdown: markdown, options: options)
+    }
+
+    private func taskLines(_ markdown: String) -> [Int] {
+        MarkdownRenderer().renderBody(markdown: markdown).taskLines
     }
 
     private func count(_ needle: String, in haystack: String) -> Int {
@@ -213,9 +217,8 @@ final class R2RendercorrectTests: XCTestCase {
 
     func testTaskScanCountsCRLFLinesOnce() {
         XCTAssertEqual(TaskLineQueue.scan("- [ ] a\r\n- [ ] b\r\n- [ ] c\r\n"), [1, 2, 3])
-        let html = render("- [ ] a\r\n- [ ] b\r\n- [ ] c\r\n")
-        XCTAssertTrue(html.contains("data-line=\"2\""))
-        XCTAssertTrue(html.contains("data-line=\"3\""))
+        XCTAssertEqual(taskLines("- [ ] a\r\n- [ ] b\r\n- [ ] c\r\n"), [1, 2, 3])
+        XCTAssertEqual(count("data-task=\"", in: render("- [ ] a\r\n- [ ] b\r\n- [ ] c\r\n")), 3)
     }
 
     func testTasksInRawHTMLOrCodeAreNotQueued() {
@@ -224,34 +227,34 @@ final class R2RendercorrectTests: XCTestCase {
         XCTAssertEqual(TaskLineQueue.scan("~~~\n```\n- [ ] in\n```\n~~~\n- [ ] real"), [6])
 
         let html = render("<!--\n- [ ] h\n-->\n- [ ] real")
-        XCTAssertEqual(count("data-line=\"", in: html), 1)
-        XCTAssertTrue(html.contains("data-line=\"4\""))
+        XCTAssertEqual(count("data-task=\"", in: html), 1)
+        XCTAssertEqual(taskLines("<!--\n- [ ] h\n-->\n- [ ] real"), [4])
     }
 
     func testBlockquotedTaskDoesNotShiftLaterCheckboxes() {
         let html = render("> - [ ] quoted\n- [ ] A\n- [ ] B")
-        XCTAssertEqual(count("data-line=\"", in: html), 2)
-        XCTAssertTrue(html.contains("data-line=\"2\""))
-        XCTAssertTrue(html.contains("data-line=\"3\""))
+        XCTAssertEqual(count("data-task=\"", in: html), 2)
+        XCTAssertTrue(html.contains("data-task=\"1\""))
+        XCTAssertEqual(taskLines("> - [ ] quoted\n- [ ] A\n- [ ] B"), [2, 3])
     }
 
     func testTasksRightAfterACalloutRenderAndMap() {
         let html = render("> [!note]\n> t\n- [ ] A\n\n- [ ] B")
         XCTAssertTrue(html.contains("callout-note"))
-        XCTAssertTrue(html.contains("data-line=\"3\""))
-        XCTAssertTrue(html.contains("data-line=\"5\""))
+        XCTAssertEqual(count("data-task=\"", in: html), 2)
+        XCTAssertEqual(taskLines("> [!note]\n> t\n- [ ] A\n\n- [ ] B"), [3, 5])
 
         let fixture = "- [ ] real one\n```\n- [ ] inside fence\n```\n> [!todo]\n> - [ ] inside callout\n- [ ] real two"
-        let fixtureHTML = render(fixture)
-        XCTAssertTrue(fixtureHTML.contains("data-line=\"1\""))
-        XCTAssertTrue(fixtureHTML.contains("data-line=\"7\""), "the task glued under the callout was swallowed as raw HTML")
+        XCTAssertEqual(count("data-task=\"", in: render(fixture)), 2)
+        XCTAssertEqual(taskLines(fixture), [1, 7], "the task glued under the callout was swallowed as raw HTML")
     }
 
     func testDisagreeingScanRendersCheckboxesReadOnly() {
         // The embed becomes a lone <img> line: an HTML block that swallows the
         // glued task, so the later box would otherwise post that task's line.
         let html = render("![[img.png]]\n- [ ] swallowed\n\n- [ ] real")
-        XCTAssertFalse(html.contains("data-line=\""))
+        XCTAssertFalse(html.contains("data-task=\""))
+        XCTAssertEqual(taskLines("![[img.png]]\n- [ ] swallowed\n\n- [ ] real"), [])
         XCTAssertTrue(html.contains("type=\"checkbox\" disabled"))
     }
 

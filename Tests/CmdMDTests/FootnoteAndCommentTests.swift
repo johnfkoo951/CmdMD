@@ -18,16 +18,24 @@ final class FootnoteAndCommentTests: XCTestCase {
         XCTAssertFalse(html.contains("[^src]"))
     }
 
-    func testNumbersFollowDefinitionOrderAndRepeatsShareANumber() {
+    func testNumbersFollowFirstReferenceOrderAndRepeatsShareANumber() {
         let html = body("A[^b] B[^a] again[^b]\n\n[^a]: first\n[^b]: second\n")
-        XCTAssertTrue(html.contains(##"<a href="#fn-2" id="fnref-2">2</a>"##), "[^b] is the 2nd definition")
-        XCTAssertTrue(html.contains(##"<a href="#fn-1" id="fnref-1">1</a>"##))
-        XCTAssertTrue(html.contains(##"<a href="#fn-2">2</a>"##), "a repeat reference gets no duplicate id")
+        XCTAssertTrue(html.contains(##"A<sup class="footnote-ref"><a href="#fn-1" id="fnref-1">1</a>"##), "[^b] is referenced first (GitHub, Obsidian)")
+        XCTAssertTrue(html.contains(##"B<sup class="footnote-ref"><a href="#fn-2" id="fnref-2">2</a>"##))
+        XCTAssertTrue(html.contains(##"again<sup class="footnote-ref"><a href="#fn-1">1</a>"##), "a repeat reference gets no duplicate id")
+        XCTAssertTrue(html.contains(##"<a id="fn-1"></a>second"##), "the list follows the superscripts")
+    }
+
+    func testNoteParagraphsStayInTheNote() {
+        let html = body("x[^1]\n\n[^1]: first para\n\n    second para\n\nafter\n")
+        XCTAssertFalse(html.contains("<pre>"), "the note's second paragraph rendered as an indented code block")
+        XCTAssertTrue(html.contains("<p>second para <a href=\"#fnref-1\" class=\"footnote-backref\">↩</a></p>"))
+        XCTAssertTrue(html.contains("<p>after</p>"))
     }
 
     func testIndentedContinuationJoinsTheNote() {
         let html = body("x[^1]\n\n[^1]: line one\n    line two\n")
-        XCTAssertTrue(html.contains("line one line two"))
+        XCTAssertTrue(html.contains("line one\nline two"), "one paragraph, joined by a soft break")
     }
 
     func testUndefinedReferenceAndCodeStayLiteral() {

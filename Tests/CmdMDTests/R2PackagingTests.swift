@@ -171,6 +171,54 @@ final class PackagingScriptTests: XCTestCase {
             atPath: Self.repoRoot.appendingPathComponent("scripts/fix-highlightr-bundle.py").path))
     }
 
+    func testPackagingShipsThePreviewLibraries() throws {
+        // The preview loads them only from Contents/Resources/PreviewLibs (or a checkout).
+        let package = try code("scripts/package_app.sh")
+        XCTAssertTrue(package.contains { $0.contains(#"cp -R "$PREVIEW_LIBS" "$RESOURCES_DIR/PreviewLibs""#) })
+        XCTAssertTrue(package.contains { $0.contains(#"PREVIEW_LIBS="$ROOT_DIR/Resources/PreviewLibs""#) })
+        XCTAssertTrue(package.contains { $0.contains(#"! -f "$PREVIEW_LIBS/cmds-pele/pele.global.js""#) },
+                      "a build without Pele has no diagrams")
+        XCTAssertTrue(try code("scripts/test_package_app.sh").contains {
+            $0.contains(#"diff -rq "$ROOT_DIR/Resources/PreviewLibs" "$APP_DIR/Contents/Resources/PreviewLibs""#)
+        })
+    }
+
+    func testPackagingRefusesABinaryThatNamesTheCheckout() throws {
+        // A source path in a release build publishes the builder's home folder.
+        for script in ["scripts/package_app.sh", "scripts/test_package_app.sh"] {
+            XCTAssertTrue(try code(script).contains {
+                $0.contains(#"grep -qF -e "$ROOT_DIR" -e "$ROOT_DIR_PHYSICAL" <<<"$slice_strings""#)
+            }, script)
+        }
+    }
+
+    func testReleaseCodeUsesNoSourcePath() throws {
+        // #filePath (and Swift 5's #file) compile to the checkout's absolute
+        // path; only debug builds, which never ship, may use them.
+        let sources = Self.repoRoot.appendingPathComponent("Sources")
+        let files = try XCTUnwrap(FileManager.default.enumerator(at: sources, includingPropertiesForKeys: nil))
+            .compactMap { $0 as? URL }
+            .filter { $0.pathExtension == "swift" }
+        XCTAssertFalse(files.isEmpty)
+        let sourcePath = try NSRegularExpression(pattern: #"#file(Path)?(?![A-Za-z])"#)
+        for file in files {
+            var conditions: [String] = []
+            for (index, line) in try String(contentsOf: file, encoding: .utf8)
+                .components(separatedBy: .newlines).enumerated() {
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                if trimmed.hasPrefix("#if ") { conditions.append(String(trimmed.dropFirst(4))) }
+                if trimmed.hasPrefix("#else") || trimmed.hasPrefix("#elseif"), !conditions.isEmpty {
+                    conditions[conditions.count - 1] = "else"
+                }
+                if trimmed.hasPrefix("#endif") { _ = conditions.popLast() }
+                guard !trimmed.hasPrefix("//"), !conditions.contains("DEBUG"),
+                      sourcePath.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) != nil
+                else { continue }
+                XCTFail("\(file.lastPathComponent):\(index + 1) uses a source path outside #if DEBUG")
+            }
+        }
+    }
+
     func testSigningArmsCleanupBeforeCreatingTheKeychain() throws {
         let lines = try code("scripts/sign_and_notarize.sh")
         let trap = try firstLine(in: lines, containing: "trap cleanup EXIT")

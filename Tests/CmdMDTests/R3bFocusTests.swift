@@ -387,7 +387,7 @@ final class R3bFocusPreviewTests: R3bFocusHostedTestCase {
             documentID: UUID(),
             isVisible: isVisible,
             positionKey: nil,
-            markdown: markdown,
+            source: PreviewSource(markdown),
             baseURL: nil,
             options: MarkdownRenderOptions(),
             scrollSyncEnabled: false,

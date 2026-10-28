@@ -30,17 +30,24 @@ enum LocalAssetURL {
     /// raw-HTML images are all covered; every tag there is renderer-emitted or
     /// re-serialized by `RawHTMLSanitizer` (double-quoted, no bare `>`), which
     /// keeps the pattern reliable.
-    static func rewriteImageSources(in body: String, baseURL: URL?, roots: [URL]) -> String {
-        let source = body as NSString
-        let tags = imageTagPattern.matches(in: body, range: NSRange(location: 0, length: source.length))
+    /// `offsets` (UTF-8, into `body`) come out indexing the result.
+    static func rewriteImageSources(in body: String, baseURL: URL?, roots: [URL], offsets: inout OffsetTracker) -> String {
+        // The live preview runs this on every render, and most bodies have no
+        // image: the regex alone scanned the whole body (1-6 ms at 900 KB).
+        guard mayContainImageTag(body) else { return body }
+        let tags = imageTagPattern.matches(in: body, range: NSRange(location: 0, length: body.utf16.count))
         guard !tags.isEmpty else { return body }
 
+        // Copied as Substrings of the body: an NSString substring per gap
+        // was transcoded back on every `+=`.
         var result = ""
         result.reserveCapacity(body.utf8.count)
-        var cursor = 0
+        var cursor = body.startIndex
         for tag in tags {
-            result += source.substring(with: NSRange(location: cursor, length: tag.range.location - cursor))
-            var tagHTML = source.substring(with: tag.range)
+            let range = body.indexRange(tag.range)
+            result += body[cursor..<range.lowerBound]
+            offsets.copied(upTo: body.utf8Offset(range.lowerBound), rebuilt: result.utf8.count)
+            var tagHTML = String(body[range])
             let tagSource = tagHTML as NSString
             if let src = sourcePattern.firstMatch(in: tagHTML, range: NSRange(location: 0, length: tagSource.length)) {
                 let value = RawHTMLSanitizer.decodeCharacterReferences(tagSource.substring(with: src.range(at: 1)))
@@ -49,10 +56,25 @@ enum LocalAssetURL {
                 }
             }
             result += tagHTML
-            cursor = NSMaxRange(tag.range)
+            offsets.swapped(upTo: body.utf8Offset(range.upperBound), rebuilt: result.utf8.count)
+            cursor = range.upperBound
         }
-        result += source.substring(from: cursor)
+        result += body[cursor...]
+        offsets.finished(source: body.utf8.count, rebuilt: result.utf8.count)
         return result
+    }
+
+    /// `<img` in any letter case (`imageTagPattern` is case-insensitive), as
+    /// one byte scan.
+    private static func mayContainImageTag(_ body: String) -> Bool {
+        var body = body
+        return body.withUTF8 { bytes in
+            guard bytes.count >= 4 else { return false }
+            for i in 0..<(bytes.count - 3) where bytes[i] == 0x3C {
+                if bytes[i + 1] | 0x20 == 0x69, bytes[i + 2] | 0x20 == 0x6D, bytes[i + 3] | 0x20 == 0x67 { return true }
+            }
+            return false
+        }
     }
 
     /// The asset URL for an image source that names a local image file inside

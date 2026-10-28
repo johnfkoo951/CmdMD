@@ -70,6 +70,10 @@ done
 # paths, so every architecture slice must carry the Xcode-build-system accessor
 # (it checks Contents/Resources) and none the native SwiftPM one (it tries a baked
 # .build path and the .app root, never Contents/Resources). Refuse anything else.
+# No slice may name this checkout either (a #filePath outside #if DEBUG): it
+# would publish the builder's home folder, and a lookup built on it reads files
+# from outside the signed app.
+ROOT_DIR_PHYSICAL="$(cd "$ROOT_DIR" && pwd -P)"
 for arch in $(lipo -archs "$EXECUTABLE"); do
   slice_strings="$(strings -a -arch "$arch" "$EXECUTABLE")"
   if ! grep -q "unable to find bundle named Highlightr_Highlightr" <<<"$slice_strings"; then
@@ -80,7 +84,22 @@ for arch in $(lipo -archs "$EXECUTABLE"); do
     echo "$arch slice: carries SwiftPM's native resource accessor (baked .build path)." >&2
     exit 1
   fi
+  if grep -qF -e "$ROOT_DIR" -e "$ROOT_DIR_PHYSICAL" <<<"$slice_strings"; then
+    echo "$arch slice: embeds the build checkout's path ($ROOT_DIR)." >&2
+    exit 1
+  fi
 done
+
+# The preview's libraries (KaTeX, Pele; see Resources/PreviewLibs/LICENSES.md). The
+# preview serves them from Contents/Resources/PreviewLibs through cmdmd-lib:// and
+# makes no network request for them, so a build without them has no math or diagrams.
+PREVIEW_LIBS="$ROOT_DIR/Resources/PreviewLibs"
+if [[ ! -f "$PREVIEW_LIBS/LICENSES.md" || ! -f "$PREVIEW_LIBS/katex/katex.min.js" \
+      || ! -f "$PREVIEW_LIBS/cmds-pele/pele.global.js" || ! -f "$PREVIEW_LIBS/cmds-pele/cmds-pele.version.json" ]]; then
+  echo "Preview libraries not found in $PREVIEW_LIBS." >&2
+  exit 1
+fi
+cp -R "$PREVIEW_LIBS" "$RESOURCES_DIR/PreviewLibs"
 
 if [[ -f "$APP_ICON" ]]; then
   cp "$APP_ICON" "$RESOURCES_DIR/AppIcon.icns"

@@ -91,6 +91,10 @@ struct AppSettings: Codable, Equatable {
     var enableMermaid: Bool = true
     var enableKaTeX: Bool = false
     var enablePreviewCodeHighlight: Bool = true
+    /// Obsidian's "Strict line breaks" (off by default there): off, a single
+    /// newline inside a paragraph shows as a line break, as in Obsidian's
+    /// reading view; on, it is a space (CommonMark / GitHub).
+    var strictLineBreaks: Bool = false
 
     // Vault & Sync
     var defaultVaultId: UUID?
@@ -157,6 +161,7 @@ struct AppSettings: Codable, Equatable {
         enableMermaid = (try? c.decodeIfPresent(Bool.self, forKey: .enableMermaid)) ?? d.enableMermaid
         enableKaTeX = (try? c.decodeIfPresent(Bool.self, forKey: .enableKaTeX)) ?? d.enableKaTeX
         enablePreviewCodeHighlight = (try? c.decodeIfPresent(Bool.self, forKey: .enablePreviewCodeHighlight)) ?? d.enablePreviewCodeHighlight
+        strictLineBreaks = (try? c.decodeIfPresent(Bool.self, forKey: .strictLineBreaks)) ?? d.strictLineBreaks
         defaultVaultId = (try? c.decodeIfPresent(UUID.self, forKey: .defaultVaultId)) ?? d.defaultVaultId
         defaultSendFolder = (try? c.decodeIfPresent(String.self, forKey: .defaultSendFolder)) ?? d.defaultSendFolder
         conflictResolution = (try? c.decodeIfPresent(FileConflictResolution.self, forKey: .conflictResolution)) ?? d.conflictResolution

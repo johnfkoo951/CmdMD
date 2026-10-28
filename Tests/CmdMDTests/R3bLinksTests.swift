@@ -251,12 +251,12 @@ final class R3bLinksTests: XCTestCase {
     func testPreviewFontsFallBackToTheSystemFont() {
         XCTAssertFalse(render("x").contains("'SF Pro Text', -apple-system"), "the default theme must not declare the stack itself")
         let sfPro = render("x", configure: { $0.preview.fontFamily = "SF Pro Text, sans-serif" })
-        XCTAssertTrue(sfPro.contains("font-family: 'SF Pro Text', -apple-system, BlinkMacSystemFont, sans-serif;"))
+        XCTAssertTrue(sfPro.contains("--font-body: 'SF Pro Text', -apple-system, BlinkMacSystemFont, sans-serif;"))
 
         let inter = render("x", configure: { $0.preview.fontFamily = "Inter, sans-serif" })
-        XCTAssertTrue(inter.contains("font-family: Inter, -apple-system, BlinkMacSystemFont, sans-serif;"))
+        XCTAssertTrue(inter.contains("--font-body: Inter, -apple-system, BlinkMacSystemFont, sans-serif;"))
 
         let georgia = render("x", configure: { $0.preview.fontFamily = "Georgia, serif" })
-        XCTAssertTrue(georgia.contains("font-family: Georgia, serif;"))
+        XCTAssertTrue(georgia.contains("--font-body: Georgia, serif;"))
     }
 }

@@ -4,7 +4,7 @@ import WebKit
 
 /// Preview security: opening an untrusted note must not run script, launch
 /// URLs or read local files.
-final class R2SecurityTests: XCTestCase {
+final class R2SecurityTests: CheckoutLibrariesTestCase {
     private func render(
         _ markdown: String,
         baseURL: URL? = nil,
@@ -75,11 +75,14 @@ final class R2SecurityTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(nonce.count, 32)
 
         let scripts = matches("<script\\b[^>]*>", in: html)
-        // hljs + init, mermaid + init, KaTeX ×3 + init, task bridge.
-        XCTAssertEqual(scripts.count, 9)
+        // hljs + init, KaTeX ×3 + init, the diagram loader, task bridge.
+        XCTAssertEqual(scripts.count, 8)
         for tag in scripts {
             XCTAssertTrue(tag.contains("nonce=\"\(nonce)\""), "script without nonce: \(tag)")
         }
+        // The scripts the loader adds after first paint get the nonce too.
+        XCTAssertTrue(html.contains("], '\(nonce)', 'auto');</script>"))
+        XCTAssertTrue(html.contains("script.nonce = nonce;"))
         XCTAssertFalse(html.contains("onload="), "inline handlers are outside the CSP")
     }
 
@@ -93,7 +96,7 @@ final class R2SecurityTests: XCTestCase {
 
         let withCode = try XCTUnwrap(csp(in: render("```swift\nlet x = 1\n```")))
         XCTAssertTrue(directive("script-src", in: withCode).contains("/highlight.min.js"))
-        XCTAssertFalse(directive("script-src", in: withCode).contains("mermaid"))
+        XCTAssertFalse(directive("script-src", in: withCode).contains("pele"))
     }
 
     // MARK: Raw HTML neutralized (F053)
@@ -150,7 +153,7 @@ final class R2SecurityTests: XCTestCase {
     func testCommentCannotHideAHandler() {
         let html = body(of: render("<div>\n<!-- <img alt=\" -->\n<img src=x onerror=alert(1) title=\"x\">\n</div>"))
         XCTAssertFalse(html.contains("onerror"))
-        XCTAssertFalse(html.contains("<!--"))
+        XCTAssertFalse(html.replacingOccurrences(of: PreviewRuntime.marker, with: "").contains("<!--"), "only the live page's block markers")
     }
 
     func testUnterminatedTagIsEscapedInsteadOfSwallowingLaterMarkup() {
@@ -261,39 +264,47 @@ final class R2SecurityTests: XCTestCase {
 
     func testCalloutTitleCodeIsEscaped() {
         let html = render("> [!tip] Use `<img src=x onerror=alert(1)>` here\n> body")
-        XCTAssertTrue(html.contains("Use `&lt;img src=x onerror=alert(1)&gt;` here"))
+        XCTAssertTrue(html.contains("Use <code>&lt;img src=x onerror=alert(1)&gt;</code> here"), "the title is Markdown, its code escaped")
         XCTAssertFalse(body(of: html).contains("<img src=x"))
     }
 
     // MARK: Pinned CDN with SRI (F060)
 
     func testCDNTagsArePinnedWithSubresourceIntegrity() {
+        // CDN pages are what HTML export and Copy as HTML produce.
         let html = render(
             "```swift\nlet x = 1\n```\n\n```mermaid\ngraph TD; A-->B\n```\n\n$x$",
-            configure: { $0.enableKaTeX = true }
+            configure: { $0.enableKaTeX = true; $0.libraries = .cdn }
         )
         XCTAssertTrue(html.contains("highlight.min.js"))
         XCTAssertTrue(html.contains("katex"))
-        XCTAssertTrue(html.contains("class=\"mermaid\""))
+        XCTAssertTrue(html.contains("<pre class=\"mermaid\">"))
 
         let cdnTags = matches("<(script|link)\\b[^>]*cdn\\.jsdelivr\\.net[^>]*>", in: html)
-        // hljs light+dark CSS, hljs, mermaid, KaTeX CSS + 3 scripts.
-        XCTAssertEqual(cdnTags.count, 8)
+        // hljs + KaTeX CSS + 3 scripts. The default code palette is the
+        // theme's own CSS (no highlight.js stylesheet), and Pele's script is
+        // inserted after DOMContentLoaded rather than written as a tag.
+        XCTAssertEqual(cdnTags.count, 5)
         for tag in cdnTags {
             XCTAssertTrue(tag.contains("integrity=\"sha384-"), "no SRI: \(tag)")
             XCTAssertTrue(tag.contains("crossorigin=\"anonymous\""), "no CORS mode: \(tag)")
         }
-        for floating in ["mermaid@11/", "katex@0.16/", "cdn-release@"] {
+        // Pele loads after first paint, pinned and hashed the same way.
+        XCTAssertEqual(matches(#"\{src: 'https://cdn\.jsdelivr\.net/npm/pele@\d+\.\d+\.\d+/dist/pele\.global\.js', integrity: 'sha384-[^']+'\}"#, in: html).count, 1)
+        for floating in ["katex@0.16/", "cdn-release@", "npm/pele/", "pele@latest"] {
             XCTAssertFalse(html.contains(floating), "floating version range: \(floating)")
         }
     }
 
-    // MARK: Mermaid (F026)
+    // MARK: Diagrams (F026)
 
-    func testMermaidUsesStrictSecurityLevel() {
+    func testDiagramsMountWithoutLinksOrImages() {
+        // cmds-pele's 'screen' profile turns Pele's links and images off (see
+        // PeleDiagramTests for the profile itself); no option turns them back on.
         let html = render("```mermaid\ngraph TD; A-->B\n```")
-        XCTAssertTrue(html.contains("securityLevel: 'strict'"))
-        XCTAssertFalse(html.contains("'loose'"))
+        XCTAssertTrue(html.contains("profile: 'screen'"))
+        XCTAssertFalse(html.contains("peleOptions"))
+        XCTAssertFalse(html.contains("links: true"))
     }
 
     // MARK: Scroll-restore injection

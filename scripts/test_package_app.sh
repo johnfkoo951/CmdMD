@@ -40,6 +40,8 @@ archs=" $(lipo -archs "$EXECUTABLE") "
 # on the first highlighted code block anywhere but on the build machine.
 [[ -n "$(find "$HIGHLIGHTR_BUNDLE" -name highlight.min.js -print -quit 2>/dev/null)" ]] \
   || fail "Highlightr_Highlightr.bundle (with highlight.min.js) missing from Contents/Resources"
+# Nor may a slice name the checkout it was built in (the builder's home folder).
+ROOT_DIR_PHYSICAL="$(cd "$ROOT_DIR" && pwd -P)"
 for arch in $(lipo -archs "$EXECUTABLE"); do
   slice_strings="$(strings -a -arch "$arch" "$EXECUTABLE")"
   grep -q "unable to find bundle named Highlightr_Highlightr" <<<"$slice_strings" \
@@ -47,7 +49,14 @@ for arch in $(lipo -archs "$EXECUTABLE"); do
   if grep -Eq "could not load resource bundle|/\.build/.*Highlightr_Highlightr\.bundle" <<<"$slice_strings"; then
     fail "$arch slice still carries SwiftPM's native resource accessor (baked .build path)"
   fi
+  if grep -qF -e "$ROOT_DIR" -e "$ROOT_DIR_PHYSICAL" <<<"$slice_strings"; then
+    fail "$arch slice embeds the build checkout's path ($ROOT_DIR)"
+  fi
 done
+
+# The preview's libraries ship inside the app, exactly as checked in.
+diff -rq "$ROOT_DIR/Resources/PreviewLibs" "$APP_DIR/Contents/Resources/PreviewLibs" >/dev/null \
+  || fail "Contents/Resources/PreviewLibs differs from Resources/PreviewLibs"
 
 # Version and build number come from VERSION.
 expected_version="$(awk -F= '$1 == "CFBundleShortVersionString" { print $2; exit }' "$ROOT_DIR/VERSION")"

@@ -503,7 +503,7 @@ struct PreviewPane: View {
             documentID: appState.currentDocument?.id,
             isVisible: appState.viewMode != .source,
             positionKey: appState.currentDocument.map(ReadingPositions.key(for:)),
-            markdown: appState.currentDocument?.content ?? "",
+            source: PreviewSource(appState.currentDocument?.content ?? ""),
             baseURL: appState.currentDocument?.fileURL?.deletingLastPathComponent(),
             options: appState.renderOptions(),
             scrollSyncEnabled: appState.settings.scrollSyncEnabled && appState.viewMode == .split,

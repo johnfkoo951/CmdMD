@@ -29,6 +29,14 @@ enum RawHTMLSanitizer {
     ]
     /// SVG animation values, which can retarget a link's href.
     private static let animationValueAttributes: Set<String> = ["values", "to", "from", "by"]
+    /// The page's own: the renderer's task boxes carry `data-task`, the
+    /// ordinal a click posts back. A note's box naming one flipped that task.
+    private static let reservedAttributes: Set<String> = ["data-task"]
+    /// Elements `document` exposes by `name` (an img by `id` too, but only
+    /// with a name): `<img name="querySelectorAll">` replaced the page
+    /// scripts' document methods, so diagrams, math, highlighting and
+    /// patching stopped (embed and object are dropped already).
+    private static let documentNamedElements: Set<String> = ["img", "form", "iframe", "embed", "object"]
 
     private static let lessThan = UInt8(ascii: "<")
     private static let greaterThan = UInt8(ascii: ">")
@@ -249,7 +257,8 @@ enum RawHTMLSanitizer {
 
     private static func serialize(_ tag: Tag) -> [UInt8] {
         var html = "<" + tag.name
-        for attribute in tag.attributes where isAllowed(attribute) {
+        let element = tag.name.lowercased()
+        for attribute in tag.attributes where isAllowed(attribute, on: element) {
             html += " " + attribute.name
             if let value = attribute.value {
                 html += "=\"" + escapeAttributeValue(value) + "\""
@@ -259,10 +268,11 @@ enum RawHTMLSanitizer {
         return Array(html.utf8)
     }
 
-    private static func isAllowed(_ attribute: (name: String, value: String?)) -> Bool {
+    private static func isAllowed(_ attribute: (name: String, value: String?), on element: String) -> Bool {
         guard isValidAttributeName(attribute.name) else { return false }
         let name = attribute.name.lowercased()
-        if name.hasPrefix("on") || name == "srcdoc" || name == "nonce" { return false }
+        if name.hasPrefix("on") || name == "srcdoc" || name == "nonce" || reservedAttributes.contains(name) { return false }
+        if name == "name", documentNamedElements.contains(element) { return false }
         guard let value = attribute.value else { return true }
         let decoded = decodeCharacterReferences(value)
         if urlAttributes.contains(name) {

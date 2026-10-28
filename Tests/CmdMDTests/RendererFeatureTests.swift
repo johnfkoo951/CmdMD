@@ -1,7 +1,7 @@
 import XCTest
 @testable import CmdMD
 
-final class RendererFeatureTests: XCTestCase {
+final class RendererFeatureTests: CheckoutLibrariesTestCase {
     private func render(_ markdown: String, configure: (inout MarkdownRenderOptions) -> Void = { _ in }) -> String {
         var options = MarkdownRenderOptions()
         configure(&options)
@@ -111,17 +111,19 @@ final class RendererFeatureTests: XCTestCase {
         XCTAssertFalse(html.contains("highlight.min.js"))
     }
 
-    // MARK: Mermaid toggle
+    // MARK: Diagram toggle (Mermaid syntax, drawn by Pele)
 
     func testMermaidDisabledRendersPlainCodeBlock() {
         let html = render("```mermaid\ngraph TD;\n```", configure: { $0.enableMermaid = false })
         XCTAssertFalse(html.contains("class=\"mermaid\""))
+        XCTAssertFalse(html.contains("<div class=\"cmdmd-diagram\">"))
+        XCTAssertFalse(html.contains("pele"))
         XCTAssertTrue(html.contains("language-mermaid"))
     }
 
     func testMermaidEnabledRendersDiagramContainer() {
         let html = render("```mermaid\ngraph TD;\n```")
-        XCTAssertTrue(html.contains("class=\"mermaid\""))
+        XCTAssertTrue(html.contains("<div class=\"cmdmd-diagram\"><pre class=\"mermaid\">graph TD;\n</pre></div>"))
     }
 
     // MARK: Heading slugs
@@ -156,8 +158,8 @@ final class RendererFeatureTests: XCTestCase {
             $0.preview.maxWidth = 750
             $0.preview.customCSS = ".x { color: red; }"
         })
-        XCTAssertTrue(html.contains("font-size: 19px"))
-        XCTAssertTrue(html.contains("max-width: 750px"))
+        XCTAssertTrue(html.contains("--fs: 19px;"))
+        XCTAssertTrue(html.contains("--measure: 750px;"))
         XCTAssertTrue(html.contains(".x { color: red; }"))
     }
 
@@ -172,15 +174,16 @@ final class RendererFeatureTests: XCTestCase {
 
     // MARK: Interactive tasks
 
-    func testTaskCheckboxCarriesSourceLine() {
+    func testTaskCheckboxMapsToItsSourceLine() {
         let html = render("intro\n\n- [ ] first\n- [x] second")
-        XCTAssertTrue(html.contains("data-line=\"3\""))
-        XCTAssertTrue(html.contains("data-line=\"4\""))
+        XCTAssertTrue(html.contains("<input type=\"checkbox\" data-task=\"0\" />"))
+        XCTAssertTrue(html.contains("<input type=\"checkbox\" checked data-task=\"1\" />"))
+        XCTAssertEqual(MarkdownRenderer().renderBody(markdown: "intro\n\n- [ ] first\n- [x] second").taskLines, [3, 4])
     }
 
     func testExportTasksAreDisabled() {
         let html = render("- [ ] item", configure: { $0.interactiveTasks = false })
-        XCTAssertFalse(html.contains("data-line"))
+        XCTAssertFalse(html.contains("data-task"))
         XCTAssertTrue(html.contains("disabled"))
     }
 

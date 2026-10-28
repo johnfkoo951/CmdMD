@@ -39,6 +39,9 @@ struct ContentView: View {
             // ⌘W and the Quick Capture hot key need to know which window
             // is the editor.
             AppWindowPolicy.editorWindow = window
+            // The editor window is up, so a preview is likely soon (a menu-bar
+            // capture alone never gets here).
+            if window != nil { PreviewWarmup.begin() }
             // A restored session can bring both panes back into a narrow
             // saved frame — fit them before the documents lay out.
             appState.reconcilePaneRoom()

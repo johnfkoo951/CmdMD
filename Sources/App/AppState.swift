@@ -1774,18 +1774,27 @@ final class AppState {
     /// by checkbox clicks in the preview. The line is re-validated against the
     /// task pattern before mutating so a stale line number can never corrupt
     /// unrelated text.
-    func toggleTask(atLine line: Int, checked: Bool, expectedLine: String? = nil) {
-        guard let doc = currentDocument else { return }
+    /// Whether the line was flipped.
+    @discardableResult
+    func toggleTask(atLine renderedLine: Int, checked: Bool, expectedLine: String? = nil, renderedSource: String? = nil) -> Bool {
+        guard let doc = currentDocument else { return false }
         var lines = doc.content.components(separatedBy: "\n")
-        guard line >= 1, line <= lines.count else { return }
+        // The text the clicked page was rendered from: an edit since (split
+        // view re-renders on a debounce) moved its lines, which map through
+        // that edit. A line the edit changed has no place to go.
+        let mapped = renderedSource.map { TaskLineMapping.line(renderedLine, renderedFrom: $0, in: doc.content) } ?? renderedLine
+        guard let line = mapped, line >= 1, line <= lines.count else {
+            showToast("Couldn't toggle that task", style: .error)
+            return false
+        }
 
         let target = lines[line - 1]
-        // The line as the clicked page rendered it: an edit that shifted lines
-        // since (split view re-renders on a debounce) points the number at a
-        // different task, which must not be the one flipped.
-        if let expectedLine, target != expectedLine {
+        // The line as the clicked page rendered it, its box aside (a second
+        // click before the re-render is still that task): a line number that
+        // now names a different task must not flip it.
+        if let expectedLine, !TaskLineMapping.same(target, expectedLine) {
             showToast("Couldn't toggle that task", style: .error)
-            return
+            return false
         }
         let ns = target as NSString
         guard let match = TaskLineQueue.taskLinePattern.firstMatch(
@@ -1793,12 +1802,13 @@ final class AppState {
             range: NSRange(location: 0, length: ns.length)
         ) else {
             showToast("Couldn't toggle that task", style: .error)
-            return
+            return false
         }
 
         let markerRange = match.range(at: 2)
         lines[line - 1] = ns.replacingCharacters(in: markerRange, with: checked ? "x" : " ")
         updateContent(lines.joined(separator: "\n"))
+        return true
     }
 
     // MARK: - Autosave
@@ -2152,7 +2162,8 @@ final class AppState {
             // Images may come from the open folder and vaults as well as the
             // note's own folder (e.g. a vault-level attachments folder).
             localAssetRoots: contentSearchRoots,
-            attachments: attachmentIndex
+            attachments: attachmentIndex,
+            obsidianLineBreaks: !settings.strictLineBreaks
         )
     }
 

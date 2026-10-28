@@ -51,7 +51,10 @@
 - **리뷰 우선** — 렌더된 프리뷰로 시작하고, `⌘1`/`⌘2`/`⌘3` 로 소스 / 분할 / 프리뷰를 전환.
 - **완전한 마크다운** — GitHub‑Flavored(테이블, 태스크 리스트, 취소선)에 더해 Obsidian
   확장 문법: `[[wiki‑links]]`, `#tags`, `> [!callouts]`, `==highlights==`.
-- **Mermaid 11 + KaTeX** — 다이어그램과 수식(`$…$`, `$$…$$`, `\[…\]`, `\(…\)`), `\ce{}` 화학식까지.
+- **다이어그램 + KaTeX** — Mermaid 문법 다이어그램을 [Pele](https://github.com/obsidianmd/pele)(Obsidian이
+  쓰는 렌더러)로 프리뷰 테마에 맞춰 그리고, 수식(`$…$`, `$$…$$`, `\[…\]`, `\(…\)`)과 `\ce{}` 화학식까지.
+- **오프라인 프리뷰** — 다이어그램·수식·코드 강조 라이브러리가 앱 안에 들어 있어 프리뷰는 네트워크
+  요청을 하지 않습니다. 내보낸 HTML만 CDN에서 불러옵니다.
 - **7가지 프리뷰 테마** — CMDS, GitHub, Obsidian, Minimal, Sepia, Newsprint, Dark Pro — 그리고
   라이트 / 다크를 따라가는 구문 강조 소스 테마.
 - **Obsidian 볼트 라우터** — 설치된 볼트를 자동 감지해 어떤 폴더로든 노트를 보냅니다.
@@ -130,7 +133,8 @@ CmdMD는 Obsidian 볼트에 연결됩니다 (Obsidian 자체 레지스트리를 
 
 Swift / SwiftUI · [swift‑markdown](https://github.com/apple/swift-markdown) ·
 [Highlightr](https://github.com/raspu/Highlightr) · [Yams](https://github.com/jpsim/Yams) ·
-Mermaid & KaTeX는 CDN으로 로드. 앱 데이터는 `~/Library/Application Support/CmdMD/`에 저장됩니다.
+[Pele](https://github.com/obsidianmd/pele)(cmds-pele 경유) · KaTeX · highlight.js 모두 앱에 포함
+(`Resources/PreviewLibs/LICENSES.md` 참고). 앱 데이터는 `~/Library/Application Support/CmdMD/`에 저장됩니다.
 `cmdmd://open?note=<name>` URL 스킴은 열린 폴더와 볼트에서 노트를 찾아 엽니다.
 
 ## 라이선스
