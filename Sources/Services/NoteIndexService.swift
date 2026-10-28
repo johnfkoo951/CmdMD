@@ -16,7 +16,14 @@ enum NoteIndexService {
     static let skippedFolderNames: Set<String> = ["node_modules", "DerivedData", "Pods", "__pycache__", "venv"]
 
     static func buildIndex(roots: [URL], limit: Int = 100_000) -> [VaultNote] {
+        buildIndexes(roots: roots, limit: limit).notes
+    }
+
+    /// The notes plus the images beside them (see `AttachmentIndex`), from
+    /// one walk: a second walk would double the time on a large vault.
+    static func buildIndexes(roots: [URL], limit: Int = 100_000) -> (notes: [VaultNote], attachments: AttachmentIndex) {
         var notes: [VaultNote] = []
+        var images: [URL] = []
         var seenPaths: Set<String> = []
 
         for root in roots {
@@ -27,15 +34,24 @@ enum NoteIndexService {
             ) else { continue }
 
             var rootCount = 0
+            var rootImageCount = 0
             for case let fileURL as URL in enumerator {
                 // A newer rebuild supersedes this one (AppState.rebuildNoteIndex).
-                if Task.isCancelled { return [] }
+                if Task.isCancelled { return ([], .empty) }
                 if skippedFolderNames.contains(fileURL.lastPathComponent),
                    (try? fileURL.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
                     enumerator.skipDescendants()
                     continue
                 }
-                guard supportedExtensions.contains(fileURL.pathExtension.lowercased()) else { continue }
+                let ext = fileURL.pathExtension.lowercased()
+                if LocalAssetURL.imageExtensions.contains(ext) {
+                    if rootImageCount < limit, seenPaths.insert(fileURL.standardizedFileURL.path).inserted {
+                        images.append(fileURL)
+                        rootImageCount += 1
+                    }
+                    continue
+                }
+                guard supportedExtensions.contains(ext) else { continue }
                 let standardized = fileURL.standardizedFileURL
                 guard seenPaths.insert(standardized.path).inserted else { continue }
 
@@ -56,7 +72,7 @@ enum NoteIndexService {
             }
         }
 
-        return Array(sorted(notes).prefix(limit))
+        return (Array(sorted(notes).prefix(limit)), AttachmentIndex(files: images))
     }
 
     /// Recently-modified notes first so completions surface what the user is

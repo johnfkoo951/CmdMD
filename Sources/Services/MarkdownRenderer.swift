@@ -168,6 +168,9 @@ struct MarkdownRenderOptions: Equatable {
     /// the preview and PDF views can't read file:// URLs. Nil (HTML export,
     /// clipboard) keeps note-relative sources so the file works elsewhere.
     var localAssetRoots: [URL]? = nil
+    /// Images in the open folder and vaults, so `![[pic.png]]` finds a picture
+    /// outside the note's folder (Obsidian's shortest-path links).
+    var attachments: AttachmentIndex = .empty
 }
 
 // MARK: - Task line mapping
@@ -272,6 +275,15 @@ class MarkdownRenderer {
         options: []
     )
 
+    /// Obsidian comments — `%%inline%%` or a `%%` … `%%` block.
+    private let commentPattern = try! NSRegularExpression(pattern: #"%%[\s\S]*?%%"#)
+    /// `[^id]: text` — a footnote definition line.
+    private let footnoteDefinitionPattern = try! NSRegularExpression(
+        pattern: #"^\[\^([^\]\s]+)\]:[ \t]?(.*)$"#
+    )
+    /// `[^id]` — a footnote reference (a definition's `[^id]:` excluded).
+    private let footnoteReferencePattern = try! NSRegularExpression(pattern: #"\[\^([^\]\s]+)\](?!:)"#)
+
     private let markPattern = try! NSRegularExpression(
         pattern: #"==([^=\n](?:[^=\n]*[^=\n])?)=="#,
         options: []
@@ -330,8 +342,11 @@ class MarkdownRenderer {
             (processedMarkdown, mathTokens) = maskMathRegions(processedMarkdown)
         }
 
+        processedMarkdown = processComments(processedMarkdown)
+        processedMarkdown = processFootnotes(processedMarkdown)
+
         if options.enableWikiLinks {
-            processedMarkdown = processWikiLinks(processedMarkdown, baseURL: baseURL, codeTokens: codeTokens)
+            processedMarkdown = processWikiLinks(processedMarkdown, baseURL: baseURL, attachments: options.attachments, codeTokens: codeTokens)
         }
         if options.enableCallouts {
             processedMarkdown = processCallouts(processedMarkdown, codeTokens: codeTokens)
@@ -393,7 +408,7 @@ class MarkdownRenderer {
             (processed, mathTokens) = maskMathRegions(processed)
         }
         if options.enableWikiLinks {
-            processed = processTags(processWikiLinks(processed, baseURL: nil, codeTokens: codeTokens))
+            processed = processTags(processWikiLinks(processed, baseURL: nil, attachments: .empty, codeTokens: codeTokens))
         }
         processed = restoreCodeRegions(processHighlights(processed), tokens: codeTokens)
 
@@ -683,7 +698,7 @@ class MarkdownRenderer {
         return result
     }
 
-    private func processWikiLinks(_ markdown: String, baseURL: URL?, codeTokens: [String: String]) -> String {
+    private func processWikiLinks(_ markdown: String, baseURL: URL?, attachments: AttachmentIndex, codeTokens: [String: String]) -> String {
         replacingMatches(of: wikiLinkPattern, in: markdown) { match, nsString in
             let isEmbed = nsString.substring(with: match.range(at: 1)) == "!"
             var target = nsString.substring(with: match.range(at: 2))
@@ -706,15 +721,14 @@ class MarkdownRenderer {
             let rawTarget = restoreCodeRegions(target, tokens: codeTokens)
 
             if isEmbed {
-                let imgExtensions = ["png", "jpg", "jpeg", "gif", "svg", "webp"]
                 let ext = (rawTarget as NSString).pathExtension.lowercased()
 
-                if imgExtensions.contains(ext) {
+                if LocalAssetURL.imageExtensions.contains(ext) {
                     // `|300` / `|300x200` sizes an image embed; any other
                     // alias is its alt text.
                     let size = label.flatMap(Self.embedSizeAttributes)
                     let altText = Self.escapeForTableCell(size == nil ? (rawLabel ?? rawTarget) : rawTarget)
-                    let imgPath = baseURL?.appendingPathComponent(rawTarget).path ?? rawTarget
+                    let imgPath = Self.embeddedImagePath(rawTarget, baseURL: baseURL, attachments: attachments)
                     return "<img src=\"file://\(htmlEscape(imgPath))\" alt=\"\(altText)\" class=\"embedded-image\"\(size ?? "") />"
                 } else {
                     return "<span class=\"embedded-note\" data-note=\"\(htmlEscape(rawTarget))\">\(displayText)</span>"
@@ -742,6 +756,15 @@ class MarkdownRenderer {
     /// table rows, so a literal pipe in generated text would end the cell.
     private static func escapeForTableCell(_ text: String) -> String {
         htmlEscape(text).replacingOccurrences(of: "|", with: "&#124;")
+    }
+
+    /// Where an image embed points: beside the note when the file is there
+    /// (or nothing else matches), else wherever the index finds that name.
+    static func embeddedImagePath(_ target: String, baseURL: URL?, attachments: AttachmentIndex) -> String {
+        guard let baseURL else { return target }
+        let beside = baseURL.appendingPathComponent(target)
+        if FileManager.default.fileExists(atPath: beside.path) { return beside.path }
+        return attachments.resolve(target, from: baseURL)?.path ?? beside.path
     }
 
     /// Obsidian's image-embed size, `300` or `300x200`, as `width`/`height`
@@ -915,6 +938,71 @@ class MarkdownRenderer {
         }
     }
 
+    /// Obsidian comments are notes to self, hidden in reading view; they
+    /// showed as literal `%%…%%`. Runs on masked text, so a `%%` inside code
+    /// is left alone.
+    private func processComments(_ markdown: String) -> String {
+        guard markdown.contains("%%") else { return markdown }
+        return replacingMatches(of: commentPattern, in: markdown) { _, _ in "" }
+    }
+
+    /// Footnotes, which swift-markdown doesn't parse — `[^1]` and its
+    /// `[^1]: text` line both showed as literal text. Definitions (with any
+    /// indented continuation lines) move to a numbered list at the end; each
+    /// reference becomes a superscript link to its note, which links back.
+    /// Numbers follow the order definitions appear, ids are those numbers, so
+    /// a label's characters never reach an attribute.
+    private func processFootnotes(_ markdown: String) -> String {
+        guard markdown.contains("[^") else { return markdown }
+
+        var kept: [String] = []
+        var definitions: [(label: String, text: String)] = []
+        var lines = markdown.components(separatedBy: "\n")[...]
+        while let line = lines.popFirst() {
+            let ns = line as NSString
+            guard let match = footnoteDefinitionPattern.firstMatch(
+                in: line, range: NSRange(location: 0, length: ns.length)
+            ) else {
+                kept.append(line)
+                continue
+            }
+            var text = ns.substring(with: match.range(at: 2))
+            while let next = lines.first, next.hasPrefix("    ") || next.hasPrefix("\t") {
+                text += " " + next.trimmingCharacters(in: .whitespaces)
+                lines.removeFirst()
+            }
+            definitions.append((ns.substring(with: match.range(at: 1)), text))
+        }
+        guard !definitions.isEmpty else { return markdown }
+
+        var numbers: [String: Int] = [:]
+        var notes: [String] = []
+        for definition in definitions where numbers[definition.label] == nil {
+            numbers[definition.label] = notes.count + 1
+            notes.append(definition.text)
+        }
+
+        var referenced: Set<Int> = []
+        let body = replacingMatches(of: footnoteReferencePattern, in: kept.joined(separator: "\n")) { match, ns in
+            guard let n = numbers[ns.substring(with: match.range(at: 1))] else {
+                return ns.substring(with: match.range)
+            }
+            // Only the first reference carries the id the ↩ link returns to.
+            let id = referenced.insert(n).inserted ? " id=\"fnref-\(n)\"" : ""
+            return "<sup class=\"footnote-ref\"><a href=\"#fn-\(n)\"\(id)>\(n)</a></sup>"
+        }
+
+        // A blank line after the opening tag ends the HTML block, so each
+        // note's text is still parsed as Markdown.
+        var section = "\n\n<section class=\"footnotes\">\n\n"
+        for (index, text) in notes.enumerated() {
+            let n = index + 1
+            section += "\(n). <a id=\"fn-\(n)\"></a>\(text) <a href=\"#fnref-\(n)\" class=\"footnote-backref\">↩</a>\n"
+        }
+        section += "\n</section>\n"
+        return body + section
+    }
+
     // MARK: Document shell
 
     /// A pinned CDN file and its Subresource Integrity hash.
@@ -1025,6 +1113,36 @@ class MarkdownRenderer {
         return html.replacingCharacters(in: headEnd, with: "<script\(nonceAttribute)>\(script)</script></head>")
     }
 
+    /// Footnote styling, plus Korean line breaking: Korean breaks between
+    /// words (어절), not between syllables: without
+    /// keep-all, "점검" split into "점 / 검" at a line end. Only under
+    /// lang="ko" — Japanese and Chinese have no spaces, so keep-all would leave
+    /// them no break points at all. A token longer than the column (a URL, an
+    /// identifier) still wraps instead of running past the margin;
+    /// break-word, unlike anywhere, leaves table min-widths alone.
+    static let textWrappingCSS = """
+        html:lang(ko) body { word-break: keep-all; }
+        body { overflow-wrap: break-word; }
+        .footnotes { margin-top: 2.5em; padding-top: 0.8em; border-top: 1px solid var(--border-color, rgba(128, 128, 128, 0.3)); font-size: 0.88em; }
+        .footnote-ref { line-height: 0; }
+        .footnote-ref a, .footnote-backref { text-decoration: none; }
+        [id^="fn-"], [id^="fnref-"] { scroll-margin-top: 1.5em; }
+        """
+
+    /// "ko" when the rendered text is Korean (Hangul syllables and no kana),
+    /// which turns on the Korean line breaking above.
+    static func documentLanguage(of body: String) -> String? {
+        var hasHangul = false
+        for scalar in body.unicodeScalars {
+            switch scalar.value {
+            case 0xAC00...0xD7A3: hasHangul = true
+            case 0x3040...0x30FF: return nil
+            default: continue
+            }
+        }
+        return hasHangul ? "ko" : nil
+    }
+
     private func wrapWithHTML(body: String, options: MarkdownRenderOptions, nonce: String) -> String {
         let hasMermaid = body.contains("class=\"mermaid\"")
         let hasCode = body.contains("<pre><code")
@@ -1118,9 +1236,11 @@ class MarkdownRenderer {
             </script>
             """ : ""
 
+        let langAttribute = Self.documentLanguage(of: body).map { " lang=\"\($0)\"" } ?? ""
+
         return """
         <!DOCTYPE html>
-        <html>
+        <html\(langAttribute)>
         <head>
             <meta charset="UTF-8">
             <meta http-equiv="Content-Security-Policy" content="\(contentSecurityPolicy(nonce: nonce, scriptURLs: scriptURLs))">
@@ -1129,6 +1249,7 @@ class MarkdownRenderer {
             <style>
                 :root { color-scheme: light dark; }
                 \(options.theme.css)
+                \(Self.textWrappingCSS)
                 \(obsidianExtensionsCSS)
                 \(mermaidCSS)
                 \(settingsOverrideCSS(options.preview))

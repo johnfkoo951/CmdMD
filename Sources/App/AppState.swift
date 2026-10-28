@@ -26,6 +26,9 @@ final class AppState {
 
     // View State
     var viewMode: ViewMode = AppState.launchDefaults.viewMode
+    /// Show a pane through `showPane` / `toggleSidebar` / `toggleInspector`,
+    /// not by setting these directly: those make room in the window first
+    /// (see `PaneRoom`).
     var sidebarVisible: Bool = AppState.launchDefaults.sidebarVisible
     var inspectorVisible: Bool = false
     var selectedSidebarTab: SidebarTab = .files
@@ -108,6 +111,8 @@ final class AppState {
 
     // Completion index
     private(set) var linkableNotes: [VaultNote] = []
+    /// Images by name, for `![[pic.png]]` embeds (built with `linkableNotes`).
+    private(set) var attachmentIndex: AttachmentIndex = .empty
     private(set) var knownTags: Set<String> = []
     private var noteIndexTask: Task<Void, Never>?
     /// A walk is running (cleared when its result lands).
@@ -243,11 +248,80 @@ final class AppState {
     /// panels always slide with the same motion instead of animating from the
     /// menu but hard-cutting from the toolbar button.
     func toggleSidebar() {
-        withAnimation(.snappy(duration: 0.25)) { sidebarVisible.toggle() }
+        if sidebarVisible {
+            withAnimation(.snappy(duration: 0.25)) { sidebarVisible = false }
+        } else {
+            showPane(.sidebar)
+        }
     }
 
     func toggleInspector() {
-        withAnimation(.snappy(duration: 0.25)) { inspectorVisible.toggle() }
+        if inspectorVisible {
+            withAnimation(.snappy(duration: 0.25)) { inspectorVisible = false }
+        } else {
+            showPane(.inspector)
+        }
+    }
+
+    /// Shows a pane only once the editor window can hold it. With the sidebar
+    /// and inspector both open, a window narrower than the split views'
+    /// combined minimum never settles and AppKit aborts the app — showing
+    /// the inspector in a ~800 pt window did that. So the window grows first
+    /// and the pane appears on the next turn, after AppKit has applied the
+    /// new frame; when the screen can't hold both panes the other one closes.
+    func showPane(_ pane: PaneRoom.Pane, animated: Bool = true) {
+        var wanted = PaneRoom.Panes(sidebar: sidebarVisible, inspector: inspectorVisible)
+        switch pane {
+        case .sidebar: wanted.sidebar = true
+        case .inspector: wanted.inspector = true
+        }
+        let plan = paneRoomPlan(for: wanted, keeping: pane)
+        let apply = { [self] in
+            let change = {
+                self.sidebarVisible = plan.panes.sidebar
+                self.inspectorVisible = plan.panes.inspector
+            }
+            if animated { withAnimation(.snappy(duration: 0.25), change) } else { change() }
+            if pane == .inspector && !plan.panes.inspector {
+                self.showToast("Window is too narrow for the Inspector", style: .warning)
+            }
+        }
+        guard let width = plan.growTo, let window = AppWindowPolicy.editorWindow else {
+            apply()
+            return
+        }
+        PaneRoom.grow(window, to: width)
+        DispatchQueue.main.async(execute: apply)
+    }
+
+    /// The editor window exists now: a restored session may have brought both
+    /// panes back into a narrow saved frame. Fit them before the documents lay
+    /// out (the loop struck about 2 s after launch, once they did).
+    func reconcilePaneRoom() {
+        let current = PaneRoom.Panes(sidebar: sidebarVisible, inspector: inspectorVisible)
+        let plan = paneRoomPlan(for: current, keeping: current.inspector ? .inspector : .sidebar)
+        if let width = plan.growTo, let window = AppWindowPolicy.editorWindow {
+            PaneRoom.grow(window, to: width)
+        }
+        if plan.panes != current {
+            Log.info("pane room: window too narrow, showing sidebar=\(plan.panes.sidebar) inspector=\(plan.panes.inspector)", .app)
+            sidebarVisible = plan.panes.sidebar
+            inspectorVisible = plan.panes.inspector
+        }
+    }
+
+    private func paneRoomPlan(for wanted: PaneRoom.Panes, keeping pane: PaneRoom.Pane) -> PaneRoom.Plan {
+        guard let window = AppWindowPolicy.editorWindow,
+              !window.styleMask.contains(.fullScreen) else {
+            return PaneRoom.Plan(panes: wanted, growTo: nil)
+        }
+        return PaneRoom.plan(
+            wanted: wanted,
+            keep: pane,
+            windowWidth: window.frame.width,
+            availableWidth: (window.screen ?? NSScreen.main)?.visibleFrame.width ?? window.frame.width,
+            required: PaneRoom.requiredWidth(for:)
+        )
     }
 
     // MARK: - Update checking
@@ -521,7 +595,7 @@ final class AppState {
         if currentFolder.map({ !Self.isSameFile($0, url) }) ?? true { clearSearch() }
         currentFolder = url
         selectedSidebarTab = .files
-        sidebarVisible = true
+        if !sidebarVisible { showPane(.sidebar, animated: false) }
         loadFileTree()
         rebuildNoteIndex()
         saveSession()
@@ -789,6 +863,7 @@ final class AppState {
 
         guard !roots.isEmpty else {
             linkableNotes = []
+            attachmentIndex = .empty
             return
         }
 
@@ -800,10 +875,16 @@ final class AppState {
             // cancels the previous task, so only the last one scans.
             try? await Task.sleep(nanoseconds: 250_000_000)
             guard !Task.isCancelled else { return }
-            let notes = NoteIndexService.buildIndex(roots: roots)
+            let (notes, attachments) = NoteIndexService.buildIndexes(roots: roots)
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 AppState.shared?.linkableNotes = notes
+                // A new index re-renders the preview (it is in the render
+                // options), so the periodic refresh keeps the old one when
+                // no image was added, moved or removed.
+                if let state = AppState.shared, !attachments.hasSameFiles(as: state.attachmentIndex) {
+                    state.attachmentIndex = attachments
+                }
                 AppState.shared?.noteIndexInFlight = false
             }
         }
@@ -2070,7 +2151,8 @@ final class AppState {
             enableCodeHighlight: settings.enablePreviewCodeHighlight,
             // Images may come from the open folder and vaults as well as the
             // note's own folder (e.g. a vault-level attachments folder).
-            localAssetRoots: contentSearchRoots
+            localAssetRoots: contentSearchRoots,
+            attachments: attachmentIndex
         )
     }
 
@@ -2162,7 +2244,7 @@ final class AppState {
     /// its field. With no folder open, the Files tab's Open Folder prompt shows.
     func beginFolderSearch() {
         selectedSidebarTab = .files
-        sidebarVisible = true
+        if !sidebarVisible { showPane(.sidebar, animated: false) }
         guard currentFolder != nil else { return }
         showFolderSearch = true
         folderSearchFocusRequest += 1

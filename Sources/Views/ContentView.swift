@@ -39,6 +39,9 @@ struct ContentView: View {
             // ⌘W and the Quick Capture hot key need to know which window
             // is the editor.
             AppWindowPolicy.editorWindow = window
+            // A restored session can bring both panes back into a narrow
+            // saved frame — fit them before the documents lay out.
+            appState.reconcilePaneRoom()
         }
         .onDisappear {
             // The window closed; CmdMD keeps running in the menu bar. A sheet

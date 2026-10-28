@@ -73,35 +73,17 @@ struct DocumentStatsView: View {
     }
 
     var body: some View {
-        HStack(spacing: 16) {
-            HStack(spacing: 4) {
-                Image(systemName: "text.word.spacing")
-                    .font(.system(size: 10))
-                Text("\(wordCount.formatted()) words")
-                    .font(.system(size: 11).monospacedDigit())
-            }
-
-            Divider()
-                .frame(height: 12)
-
-            HStack(spacing: 4) {
-                Image(systemName: "character")
-                    .font(.system(size: 10))
-                Text("\(characterCount.formatted()) chars")
-                    .font(.system(size: 11).monospacedDigit())
-            }
-
-            if wordCount > 0 {
-                Divider()
-                    .frame(height: 12)
-
-                HStack(spacing: 4) {
-                    Image(systemName: "clock")
-                        .font(.system(size: 10))
-                    Text("\(readingTimeMinutes) min read")
-                        .font(.system(size: 11).monospacedDigit())
-                }
-            }
+        // The counters must never set the window's minimum width. Laid out at
+        // full size they added ~250 pt to the detail column's minimum, so with
+        // the sidebar and inspector open a half-screen tile (or a restored
+        // narrow frame) fell below the split view's minimum — an endless
+        // update-constraints loop that AppKit ends by aborting the app.
+        // Drop counters as the bar narrows instead.
+        ViewThatFits(in: .horizontal) {
+            counters(characters: true, readingTime: true)
+            counters(characters: false, readingTime: true)
+            counters(characters: false, readingTime: false)
+            Color.clear.frame(width: 0, height: 0)
         }
         .foregroundColor(.secondary)
         .opacity(countedID == nil ? 0 : 1)
@@ -121,6 +103,33 @@ struct DocumentStatsView: View {
             wordCount = counts.0
             characterCount = counts.1
             countedID = document.id
+        }
+    }
+
+    private func counters(characters: Bool, readingTime: Bool) -> some View {
+        HStack(spacing: 16) {
+            counter("text.word.spacing", "\(wordCount.formatted()) words")
+
+            if characters {
+                Divider()
+                    .frame(height: 12)
+                counter("character", "\(characterCount.formatted()) chars")
+            }
+
+            if readingTime && wordCount > 0 {
+                Divider()
+                    .frame(height: 12)
+                counter("clock", "\(readingTimeMinutes) min read")
+            }
+        }
+    }
+
+    private func counter(_ symbol: String, _ text: String) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: symbol)
+                .font(.system(size: 10))
+            Text(text)
+                .font(.system(size: 11).monospacedDigit())
         }
     }
 
