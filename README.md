@@ -52,7 +52,7 @@ then file it into the correct vault folder with templates and rules.
 - **Full Markdown** — GitHub‑Flavored (tables, task lists, strikethrough) plus Obsidian
   extensions: `[[wiki‑links]]`, `#tags`, `> [!callouts]`, `==highlights==`.
 - **Diagrams + KaTeX** — Mermaid‑syntax diagrams drawn by [Pele](https://github.com/obsidianmd/pele)
-  (the renderer Obsidian uses), themed to match the preview, and math (`$…$`, `$$…$$`, `\[…\]`, `\(…\)`)
+  (the renderer Obsidian uses) in the CMDS vault's diagram colors on every theme, and math (`$…$`, `$$…$$`, `\[…\]`, `\(…\)`)
   with `\ce{}` chemistry.
 - **Offline preview** — diagrams, math and code highlighting ship inside the app; the preview
   makes no network requests. Only exported HTML loads them from a CDN.

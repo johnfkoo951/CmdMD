@@ -23,13 +23,13 @@ final class RenderFidelityTests: XCTestCase {
 
     func testTaskCheckboxSitsInsideTheFirstParagraph() {
         let html = body("- [ ] todo\n- [x] done\n")
-        XCTAssertTrue(html.contains("<li class=\"task-list-item\"><p><input type=\"checkbox\" data-task=\"0\" /> todo</p>"))
+        XCTAssertTrue(html.contains("<li class=\"task-list-item\"><p><input type=\"checkbox\" data-task=\"0\" />todo</p>"))
         XCTAssertTrue(html.contains("<input type=\"checkbox\" checked data-task=\"1\""))
     }
 
     func testQuotedTasksRenderReadOnlyAndDontShiftTheQueue() {
         let html = body("> - [ ] quoted\n\n- [ ] real\n")
-        XCTAssertTrue(html.contains("<p><input type=\"checkbox\" disabled /> quoted</p>"))
+        XCTAssertTrue(html.contains("<p><input type=\"checkbox\" disabled />quoted</p>"))
         XCTAssertTrue(html.contains("data-task=\"0\""))
         XCTAssertEqual(MarkdownRenderer().renderBody(markdown: "> - [ ] quoted\n\n- [ ] real\n").taskLines, [3])
         XCTAssertFalse(html.contains("[ ] quoted"))

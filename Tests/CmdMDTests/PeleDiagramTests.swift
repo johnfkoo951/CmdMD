@@ -197,8 +197,10 @@ final class PeleDiagramTests: CheckoutLibrariesTestCase {
                 XCTAssertTrue(html.contains(token), "\(theme): \(token)")
             }
             XCTAssertTrue(html.contains("--font-body: Inter, -apple-system, BlinkMacSystemFont, sans-serif"), theme.rawValue)
-            // CMDS keeps cmds-pele's palette, the brand's own.
-            XCTAssertEqual(html.contains("--cp-accent:var(--accent)"), theme != .cmds, theme.rawValue)
+            // Every theme keeps cmds-pele's palette, the main vault's.
+            for palette in ["--cp-accent:", "--cp-critical:", "--cp-series-", "--cp-key-fill:", "--cp-aux-"] {
+                XCTAssertFalse(html.contains(palette), "\(theme) overrides the vault palette: \(palette)")
+            }
             XCTAssertTrue(html.contains("'\(theme == .darkPro ? "dark" : "auto")');</script>"), theme.rawValue)
         }
     }
@@ -280,7 +282,27 @@ final class PeleDiagramTests: CheckoutLibrariesTestCase {
                     sourcesShown: all('.cmdmd-diagram-failed > pre.mermaid').length,
                     pending: document.documentElement.classList.contains('cmdmd-diagrams-pending'),
                     pwned: typeof window.pwned,
-                    injected: all('.cmdmd-diagram img, .cmdmd-diagram script').length
+                    injected: all('.cmdmd-diagram img, .cmdmd-diagram script').length,
+                    colors: (() => {
+                        const resolve = value => {
+                            const probe = document.createElement('div');
+                            probe.style.color = value;
+                            document.body.appendChild(probe);
+                            const color = getComputedStyle(probe).color;
+                            probe.remove();
+                            return color;
+                        };
+                        const svg = document.querySelector('.cmdmd-diagram svg.pele');
+                        const key = svg.querySelector('.cmds-key :is(rect, polygon, path):not(.pele-marker)');
+                        return {
+                            dark: matchMedia('(prefers-color-scheme: dark)').matches,
+                            edge: getComputedStyle(svg.querySelector('.pele-edge path:not(.pele-marker)')).stroke,
+                            node: getComputedStyle(svg.querySelector('.pele-node:not(.cmds-key) rect')).fill,
+                            key: getComputedStyle(key).stroke,
+                            text: resolve('var(--text-primary)'),
+                            surface: resolve('var(--bg-secondary)')
+                        };
+                    })()
                 };
                 """, arguments: [:], in: nil, in: .page) { value in
                 if case .success(let dictionary as [String: Any]) = value {
@@ -308,5 +330,13 @@ final class PeleDiagramTests: CheckoutLibrariesTestCase {
         XCTAssertEqual(page["pending"] as? Bool, false)
         XCTAssertEqual(page["pwned"] as? String, "undefined")
         XCTAssertEqual(page["injected"] as? Int, 0)
+
+        // Drawn as in the main vault, even on the GitHub theme: lines in the
+        // text color, nodes on the secondary background, and the key node in
+        // the vault plugin's accent (green light, pink dark).
+        let colors = try XCTUnwrap(page["colors"] as? [String: Any])
+        XCTAssertEqual(colors["edge"] as? String, colors["text"] as? String)
+        XCTAssertEqual(colors["node"] as? String, colors["surface"] as? String)
+        XCTAssertEqual(colors["key"] as? String, colors["dark"] as? Bool == true ? "rgb(233, 133, 162)" : "rgb(19, 69, 56)")
     }
 }

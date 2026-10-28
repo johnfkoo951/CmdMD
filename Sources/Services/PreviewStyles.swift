@@ -233,24 +233,21 @@ enum PreviewStyles {
         """)
 
     /// Pele's --cp-* contract (cmds-pele "테마 계약"), set on the diagram's
-    /// container so the mounted `.cmds-pele` inherits it. CMDS hands Pele
-    /// only the page's background, text and fonts and keeps cmds-pele's own
-    /// brand palette (green light, pink dark), as the vault plugin does;
-    /// every other theme derives the palette from its tokens, so diagrams
-    /// match the theme and its dark variant.
-    static func diagramTokens(for theme: PreviewTheme) -> String {
-        let page = "--cp-bg: var(--bg-primary); --cp-fg: var(--text-primary); --cp-font: var(--font-body); --cp-font-mono: var(--font-mono); --cp-caption: var(--text-secondary);"
-        guard theme != .cmds else { return page }
-        return page + " --cp-muted: var(--text-secondary); --cp-line: color-mix(in srgb, var(--text-primary) 72%, var(--bg-primary)); --cp-surface: var(--bg-secondary); --cp-surface-alt: color-mix(in srgb, var(--accent) 9%, var(--bg-secondary)); --cp-border: color-mix(in srgb, var(--text-secondary) 62%, var(--bg-primary)); --cp-accent: var(--accent); --cp-critical: var(--c-red); --cp-series-1: var(--accent); --cp-key-fill: color-mix(in srgb, var(--accent) 10%, var(--bg-primary)); --cp-aux-fill: var(--bg-secondary); --cp-aux-stroke: var(--border-color); --cp-aux-text: var(--text-secondary); --cp-radius: 4px;"
-    }
+    /// container so the mounted `.cmds-pele` inherits it. Every theme draws
+    /// diagrams the way the main vault does. The page fills the roles
+    /// Obsidian's app.css gives the vault theme: nodes on the secondary
+    /// background with the border color, lines and labels in the text color,
+    /// and the theme's fonts. The palette (accent, series, critical, key and
+    /// aux nodes) is left to cmds-pele, the same tokens.json the vault's
+    /// cmds-pele-vault plugin is built from, so pele-sync keeps the two equal.
+    static let diagramTokens = "--cp-bg: var(--bg-primary); --cp-fg: var(--text-primary); --cp-muted: var(--text-secondary); --cp-line: var(--text-primary); --cp-surface: var(--bg-secondary); --cp-surface-alt: var(--bg-secondary); --cp-border: var(--border-color); --cp-font: var(--font-body); --cp-font-mono: var(--font-mono); --cp-caption: var(--text-secondary);"
 
     /// Diagrams sit in the text, unframed like the vault's. Until Pele
     /// settles the source keeps its space but isn't shown; a diagram wider
     /// than the column (Pele doesn't always keep maxWidth) scrolls in place.
     /// Diagram pages only.
-    static func diagram(for theme: PreviewTheme) -> String {
-        compact("""
-        .cmdmd-diagram { overflow-x: auto; text-align: center; \(diagramTokens(for: theme)) }
+    static let diagram = compact("""
+        .cmdmd-diagram { overflow-x: auto; text-align: center; \(diagramTokens) }
         .cmdmd-diagram .cmds-figure { margin: 0; }
         .cmdmd-diagram > pre { text-align: left; }
         .cmdmd-diagrams-pending .cmdmd-diagram:not(.cmdmd-diagram-failed) > pre { visibility: hidden; min-height: 8em; }
@@ -258,10 +255,9 @@ enum PreviewStyles {
         .cmdmd-diagram-caption { margin: calc(0.1em - var(--space)) 0 calc(var(--space) * 1.4); font-size: 0.875em; line-height: 1.5; text-align: center; color: var(--text-secondary); break-before: avoid; }
         .cmdmd-diagram-caption em { font-style: normal; }
         """)
-    }
 
-    /// cmds-pele's `data-cp-theme`: the palette for the colors a theme
-    /// leaves to it (series, critical). Dark Pro is dark in either appearance.
+    /// cmds-pele's `data-cp-theme`: which half of its palette (the vault's
+    /// light green or dark pink) to use. Dark Pro is dark in either appearance.
     static func diagramScheme(for theme: PreviewTheme) -> String {
         theme == .darkPro ? "dark" : "auto"
     }

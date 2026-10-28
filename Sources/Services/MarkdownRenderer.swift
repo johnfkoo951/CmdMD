@@ -1614,7 +1614,7 @@ class MarkdownRenderer {
         var diagramIncludes = ""
         if options.enableMermaid, utf8Contains(body, HTMLVisitor.diagramOpening), let diagrams = libraries.diagrams {
             scriptURLs += diagrams.scripts.map(\.url)
-            diagramCSS = PreviewStyles.diagram(for: options.theme)
+            diagramCSS = PreviewStyles.diagram
             diagramIncludes = self.diagramIncludes(diagrams, theme: options.theme, nonce: nonce)
         }
 
@@ -2385,8 +2385,10 @@ struct HTMLVisitor: MarkupVisitor {
         for child in item.children {
             // The box goes INSIDE the first paragraph, on the text's line
             // (GitHub's markup); before it, a block <p> pushed the text below.
+            // No space after it, as in Obsidian: the box hangs in the gutter,
+            // and a space would start the first line right of the wrapped ones.
             if let paragraph = child as? Paragraph, !pending.isEmpty {
-                out += "<p>\(pending) "
+                out += "<p>\(pending)"
                 visitInline(paragraph.children, droppingPrefix: markerLength)
                 out += "</p>\n"
             } else {

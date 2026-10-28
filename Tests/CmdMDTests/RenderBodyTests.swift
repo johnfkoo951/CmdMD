@@ -43,7 +43,7 @@ final class RenderBodyTests: XCTestCase {
         XCTAssertEqual(html.count, 6)
         XCTAssertEqual(html[0], "<h1 id=\"제목-x\">제목 <span class='cmdmd-math'>$x$</span></h1>\n")
         XCTAssertEqual(html[1], "<p>문단 <span class='cmdmd-math'>$y$</span> <img src=\"cmdmd-asset://local/notes/p.png\" alt=\"p\" /></p>\n")
-        XCTAssertEqual(html[2], "<ul>\n<li class=\"task-list-item\"><p><input type=\"checkbox\" data-task=\"0\" /> 할 일</p>\n</li>\n</ul>\n")
+        XCTAssertEqual(html[2], "<ul>\n<li class=\"task-list-item\"><p><input type=\"checkbox\" data-task=\"0\" />할 일</p>\n</li>\n</ul>\n")
         XCTAssertEqual(body.taskLines, [5])
         XCTAssertTrue(html[3].hasPrefix("<div class=\"callout callout-note\">"), html[3])
         XCTAssertTrue(html[3].hasSuffix("본문 <span class='cmdmd-math'>$z$</span></p>\n</div></div>\n"), html[3])
@@ -68,7 +68,7 @@ final class RenderBodyTests: XCTestCase {
         let html = blocks(MarkdownRenderer().renderBody(markdown: "$$\n- [ ] a\n$$\n\n- [ ] b\n", options: options))
         XCTAssertEqual(html.count, 2)
         XCTAssertTrue(html[0].hasPrefix("<p><span class='cmdmd-math'>$$"), html[0])
-        XCTAssertEqual(html[1], "<ul>\n<li class=\"task-list-item\"><p><input type=\"checkbox\" disabled /> b</p>\n</li>\n</ul>\n")
+        XCTAssertEqual(html[1], "<ul>\n<li class=\"task-list-item\"><p><input type=\"checkbox\" disabled />b</p>\n</li>\n</ul>\n")
     }
 
     func testEmptyNoteHasNoBlocks() {

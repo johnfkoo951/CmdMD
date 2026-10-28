@@ -166,6 +166,18 @@ CmdMD isn't sandboxed, so `URLSession` works without extra entitlements.
   caption (`p.cmdmd-diagram-caption`; the diagram's `pre` gets `data-captioned` so Pele
   mounts it without a figure). `%% @caption:` is used only when there is no such line —
   cmds-pele's `catalog/SURFACES.md` rule, because the visible line is what Obsidian shows.
+- **Diagram colors:** every theme draws diagrams the way the main vault does.
+  `PreviewStyles.diagramTokens` fills only the roles Obsidian's `app.css` takes from the
+  vault theme: `--cp-bg/fg/muted`, `--cp-line` = the text color, `--cp-surface(-alt)` =
+  `--bg-secondary`, `--cp-border` = `--border-color`, and the fonts. It never sets the
+  palette (accent, series, critical, key/aux), so cmds-pele's defaults apply. Those come
+  from the same `tokens.json` as the vault's `cmds-pele-vault` plugin. The roles were read
+  from the running vault (offscreen `MarkdownRenderer.render`, 2026-10-28). On Sepia light's
+  cream, series 4 sits at 4.37:1 against cmds-pele's 4.5 rule
+  (`testVaultDiagramPaletteHoldsOnEveryThemeBackground`).
+- **Task boxes:** `<p><input …/>text`, with no space after the box. The box hangs in the
+  bullet's gutter, and a space started the first line ~4 px right of its wrapped lines
+  (`testWrappedTaskTextLinesUpInWebKit`).
 
 ---
 

@@ -52,7 +52,7 @@
 - **완전한 마크다운** — GitHub‑Flavored(테이블, 태스크 리스트, 취소선)에 더해 Obsidian
   확장 문법: `[[wiki‑links]]`, `#tags`, `> [!callouts]`, `==highlights==`.
 - **다이어그램 + KaTeX** — Mermaid 문법 다이어그램을 [Pele](https://github.com/obsidianmd/pele)(Obsidian이
-  쓰는 렌더러)로 프리뷰 테마에 맞춰 그리고, 수식(`$…$`, `$$…$$`, `\[…\]`, `\(…\)`)과 `\ce{}` 화학식까지.
+  쓰는 렌더러)로 모든 테마에서 CMDS 볼트와 같은 색으로 그리고, 수식(`$…$`, `$$…$$`, `\[…\]`, `\(…\)`)과 `\ce{}` 화학식까지.
 - **오프라인 프리뷰** — 다이어그램·수식·코드 강조 라이브러리가 앱 안에 들어 있어 프리뷰는 네트워크
   요청을 하지 않습니다. 내보낸 HTML만 CDN에서 불러옵니다.
 - **7가지 프리뷰 테마** — CMDS, GitHub, Obsidian, Minimal, Sepia, Newsprint, Dark Pro — 그리고
