@@ -235,6 +235,62 @@ dumps byte-exact output for proving a refactor changes nothing.
 
 ---
 
+## 11. Vault-scale paths: Omnisearch, content search, the note index
+
+**Symptom** (measured on two real vaults: 20k notes, 2.9k images, 188 MB of Markdown).
+Each Omnisearch keystroke blocked the main thread 80–110 ms. A content search for a
+word in few notes read the whole vault for 12 s (Korean 19 s); the sidebar's folder
+search took 3.3 s for 500 hits. The note index walk, run at launch and on every switch
+back to CmdMD, cost 1.1–1.4 s of CPU.
+
+**Root causes.**
+- `String.range(of:options:)` calls NSString's method through a bridge that reads a
+  native String a character at a time. On an `NSString` read straight from the file the
+  same call (same case-insensitive, canonical-equivalence rules) is ~7× faster.
+- Omnisearch lowercased every title and path per keystroke and matched `Character`s,
+  normalizing decomposed Korean names on every compare, then sorted every match.
+- The index walk standardized every file URL (a stat each), hashed every path into a
+  `Set` (Korean names are normalized before hashing) and compared prefixes canonically.
+
+**Fix.**
+- `OmnisearchView.fileHits` scores the notes' precomputed keys (`VaultNote.searchKey`:
+  NFC, lowercased UTF-8) scalar by scalar with `memmem` and keeps a bounded top 10.
+  A query scalar's whole UTF-8 sequence can only match at a scalar boundary (a lead byte
+  never occurs inside another scalar), so the points are the Character version's. 1–8 ms.
+- `AppState.performSearch` checks files in batches (32, doubling to 512) in a task
+  group with `NSString`, then reads the matches for lines in walk order: the same hits in
+  the same order. 0.43 s for the miss, 0.17 / 0.94 s for 500 hits.
+- `NoteIndexService.buildIndexes` hashes paths only when one root holds another and
+  compares prefixes by bytes first. 0.5 s.
+
+**The URL spelling trap** (caught by the equivalence tests). A walk hands back names
+*as stored*: often composed (NFC — Obsidian and most tools write that), and under
+`/private` for roots in /tmp or /var. `standardizedFileURL` respells the name decomposed
+and drops `/private`, and `URL ==` compares bytes, so the index must keep producing
+exactly that spelling: it rebuilds it from `NSString.getFileSystemRepresentation` with
+`CFURLCreateFromFileSystemRepresentation` (equal for all 32,720 files of the vaults and
+Downloads). `URL(fileURLWithPath:)` is *not* equivalent: it leaves `;` bare where the
+walk writes `%3B`. Tests that need the as-stored spelling must create the file with
+POSIX `open` (Foundation stores names decomposed) and live outside `/var/folders`
+(`NoteIndexEquivalenceUserFolderTests`, `UnicodeTabIdentityTests` use ~/Library/Caches).
+
+The same two spellings opened one note in two tabs (sidebar vs Omnisearch file hit or
+wiki link). Tab lookups go through `AppState.isSameDocumentURL`, which also compares
+paths with String `==` (canonical).
+
+### Measuring
+
+```bash
+CMDMD_VAULT_BENCH_ROOTS="/path/vault1:/path/vault2" swift test -c release \
+    -Xswiftc -enable-testing --filter VaultIndexBenchmarkTests
+```
+
+Times each path and checks it against the replaced implementations kept in the tests
+(`referenceFileHits`, `referenceSearch`, `referenceIndexes`) on the real vaults. A vault
+being written to while it runs can make the index comparison differ.
+
+---
+
 ## Release flow
 
 `scripts/package_app.sh` builds a universal (arm64 + x86_64) release, bundles
