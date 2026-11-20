@@ -671,12 +671,12 @@ final class AppState {
         let slug = markdownHeadingSlug(heading)
         let scroll = { [weak self] in
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                guard let self, self.currentDocument?.fileURL == url else { return }
+                guard let self, Self.isSameDocumentURL(self.currentDocument?.fileURL, url) else { return }
                 self.scrollToHeading(slug: slug)
             }
         }
 
-        if tabs.contains(where: { $0.fileURL == url }) {
+        if tabs.contains(where: { Self.isSameDocumentURL($0.fileURL, url) }) {
             openDocument(at: url, inNewTab: true)
             scroll()
             return
@@ -703,8 +703,19 @@ final class AppState {
         }
     }
 
+    /// Whether a tab's file is `url`. One note can arrive spelled two ways: a
+    /// name stored composed (as Obsidian writes Korean) comes back as stored
+    /// from folder listings (sidebar, content search) and decomposed from
+    /// standardized URLs (Omnisearch file hits, wiki links), and URL `==`
+    /// compares bytes, so those opens gave the note a second tab. String `==`
+    /// compares canonically: the paths match.
+    static func isSameDocumentURL(_ a: URL?, _ b: URL) -> Bool {
+        guard let a else { return false }
+        return a == b || (a.isFileURL && b.isFileURL && a.path == b.path)
+    }
+
     func openDocument(at url: URL, inNewTab: Bool = false, scrollToLine line: Int? = nil) {
-        if let existingTab = tabs.first(where: { $0.fileURL == url }) {
+        if let existingTab = tabs.first(where: { Self.isSameDocumentURL($0.fileURL, url) }) {
             activeTabId = existingTab.id
             if let line { scrollEditor(toLine: line) }
             return
@@ -741,7 +752,7 @@ final class AppState {
 
     @MainActor
     private func loadAndActivateDocument(at url: URL, inNewTab: Bool) async {
-        if let existingTab = tabs.first(where: { $0.fileURL == url }) {
+        if let existingTab = tabs.first(where: { Self.isSameDocumentURL($0.fileURL, url) }) {
             activeTabId = existingTab.id
             return
         }
@@ -756,7 +767,7 @@ final class AppState {
             // Checked again after the read: an open of the same file that
             // finished meanwhile (a second click, a Finder open racing session
             // restore) already has a tab, and a second one would go stale.
-            if let existingTab = tabs.first(where: { $0.fileURL == url }) {
+            if let existingTab = tabs.first(where: { Self.isSameDocumentURL($0.fileURL, url) }) {
                 activeTabId = existingTab.id
                 return
             }
@@ -2185,7 +2196,7 @@ final class AppState {
     }
 
     private func addToRecentFiles(_ url: URL) {
-        recentFiles.removeAll { $0 == url }
+        recentFiles.removeAll { Self.isSameDocumentURL($0, url) }
         recentFiles.insert(url, at: 0)
         if recentFiles.count > 20 {
             recentFiles = Array(recentFiles.prefix(20))
@@ -3082,7 +3093,7 @@ final class AppState {
         // recents and session files per tab.
         Task { @MainActor in
             var loaded: [MarkdownDocument] = []
-            for url in files where !tabs.contains(where: { $0.fileURL == url }) {
+            for url in files where !tabs.contains(where: { Self.isSameDocumentURL($0.fileURL, url) }) {
                 do {
                     loaded.append(try await fileService.loadDocument(from: url))
                 } catch {
@@ -3094,7 +3105,7 @@ final class AppState {
             for document in loaded {
                 // Re-checked: a file opened meanwhile (e.g. from Finder) keeps its tab.
                 guard let url = document.fileURL,
-                      !tabs.contains(where: { $0.fileURL == url }) else { continue }
+                      !tabs.contains(where: { Self.isSameDocumentURL($0.fileURL, url) }) else { continue }
                 let tab = EditorTab(documentId: document.id, fileURL: url, title: document.displayTitle)
                 documents[document.id] = document
                 originalContents[document.id] = document.fullText
@@ -3109,7 +3120,7 @@ final class AppState {
             // double-clicked in Finder to launch the app, a sidebar click.
             // That stays in front instead of the session's active tab.
             if activeTabId == nil {
-                if let activeURL, let tab = tabs.first(where: { $0.fileURL == activeURL }) {
+                if let activeURL, let tab = tabs.first(where: { Self.isSameDocumentURL($0.fileURL, activeURL) }) {
                     activeTabId = tab.id
                 } else {
                     activeTabId = restored.last?.id
