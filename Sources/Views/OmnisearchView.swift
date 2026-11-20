@@ -72,25 +72,100 @@ struct OmnisearchView: View {
             }
         }
 
-        let lowered = query.lowercased()
+        // Runs on the main thread for every keystroke, over the whole index
+        // (20k notes took 80–110 ms a key with Character matching on fresh
+        // lowercased copies). The notes' precomputed match keys and a bounded
+        // top list rank the same notes in the same order in a few ms.
+        let scalars = Self.scalarSequences(of: VaultNote.searchKey(for: query))
         let recents = Set(recentFiles)
 
-        return notes
-            .compactMap { note -> (VaultNote, Int)? in
-                let score = Command.fuzzyScore(query: lowered, in: note.title.lowercased())
-                    ?? Command.fuzzyScore(query: lowered, in: note.path.lowercased())
-                guard var score else { return nil }
-                if recents.contains(note.url) { score += 20 }
-                return (note, score)
+        var top: [(index: Int, score: Int)] = []
+        top.reserveCapacity(maxFileHits + 1)
+        func ranksBefore(_ lhs: (index: Int, score: Int), _ rhs: (index: Int, score: Int)) -> Bool {
+            if lhs.score != rhs.score { return lhs.score > rhs.score }
+            return notes[lhs.index].modifiedAt > notes[rhs.index].modifiedAt
+        }
+
+        for index in notes.indices {
+            guard var score = fuzzyScore(query: scalars, in: notes[index].titleKey)
+                    ?? fuzzyScore(query: scalars, in: notes[index].pathKey) else { continue }
+            // Hashing the URL is the costliest step left; skip it for notes
+            // the recents boost couldn't lift into a full list.
+            if top.count == maxFileHits, !ranksBefore((index, score + 20), top[maxFileHits - 1]) { continue }
+            if recents.contains(notes[index].url) { score += 20 }
+
+            // Inserted after equals: ties keep the index order, as the sort did.
+            let candidate = (index: index, score: score)
+            if top.count == maxFileHits, !ranksBefore(candidate, top[maxFileHits - 1]) { continue }
+            top.insert(candidate, at: top.firstIndex { ranksBefore(candidate, $0) } ?? top.count)
+            if top.count > maxFileHits { top.removeLast() }
+        }
+
+        return top.map {
+            let note = notes[$0.index]
+            return Hit(kind: .file, title: note.title, subtitle: note.path, url: note.url, line: nil)
+        }
+    }
+
+    private static let maxFileHits = 10
+
+    /// A match key (`VaultNote.searchKey`) cut into its Unicode scalars' UTF-8 sequences.
+    static func scalarSequences(of key: [UInt8]) -> [[UInt8]] {
+        var sequences: [[UInt8]] = []
+        for byte in key {
+            // A continuation byte (10xxxxxx) extends the scalar before it.
+            if byte & 0xC0 == 0x80, !sequences.isEmpty {
+                sequences[sequences.count - 1].append(byte)
+            } else {
+                sequences.append([byte])
             }
-            .sorted { lhs, rhs in
-                if lhs.1 != rhs.1 { return lhs.1 > rhs.1 }
-                return lhs.0.modifiedAt > rhs.0.modifiedAt
+        }
+        return sequences
+    }
+
+    /// `Command.fuzzyScore` over a match key, scalar by scalar: the same
+    /// points (start of name, after a space, `/` or `-`, consecutive runs),
+    /// minus one per 8 scalars of length. Keys are NFC, where a Hangul
+    /// syllable or accented letter is one scalar, so this counts as the
+    /// Character version did. Each query scalar is found as its whole UTF-8
+    /// sequence; a sequence starts with a lead byte, which never occurs
+    /// inside another scalar, so every hit starts on a scalar boundary.
+    static func fuzzyScore(query: [[UInt8]], in candidate: [UInt8]) -> Int? {
+        guard !query.isEmpty else { return 0 }
+        return candidate.withUnsafeBytes { hay -> Int? in
+            guard let base = hay.baseAddress else { return nil }
+            var score = 0
+            var searchStart = 0
+            var previousEnd: Int?
+
+            for scalar in query {
+                let found: Int? = scalar.withUnsafeBytes { pin in
+                    guard searchStart < hay.count,
+                          let hit = memmem(base + searchStart, hay.count - searchStart, pin.baseAddress, pin.count)
+                    else { return nil }
+                    return base.distance(to: UnsafeRawPointer(hit))
+                }
+                guard let found else { return nil }
+
+                if found == previousEnd {
+                    score += 8 // consecutive run
+                } else if found == 0 {
+                    score += 10 // start of string
+                } else {
+                    // An ASCII byte is a whole scalar; a multi-byte scalar's
+                    // last byte (10xxxxxx) is never a separator.
+                    let before = hay[found - 1]
+                    score += (before == 0x20 || before == 0x2F || before == 0x2D) ? 6 : 1
+                }
+
+                previousEnd = found + scalar.count
+                searchStart = found + scalar.count
             }
-            .prefix(10)
-            .map { note, _ in
-                Hit(kind: .file, title: note.title, subtitle: note.path, url: note.url, line: nil)
-            }
+
+            // Shorter candidates with the same hits rank higher.
+            let scalarCount = hay.reduce(0) { $0 + ($1 & 0xC0 == 0x80 ? 0 : 1) }
+            return score - scalarCount / 8
+        }
     }
 
     private func refreshFileHits() {

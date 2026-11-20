@@ -2302,8 +2302,42 @@ final class AppState {
     static func performSearch(query: String, in folders: [URL], limit: Int = 500) async -> [SearchResult] {
         var results: [SearchResult] = []
         var scanned: Set<String> = []
+        // Files go through in batches: every file of a batch is checked at
+        // once, then the matches are read for lines in walk order, so hits
+        // arrive in the same order as from a one-by-one scan. Batches start
+        // small (a common word fills the list from the first few notes) and
+        // grow for a rare one, which reads every note.
+        var batch: [URL] = []
+        var batchSize = 32
+
+        /// Lines of the matching files in `batch`; true once `limit` is reached.
+        func drain() async -> Bool {
+            defer {
+                batch.removeAll(keepingCapacity: true)
+                batchSize = min(batchSize * 2, 512)
+            }
+            let matches = await filesContaining(query, in: batch)
+            for (fileURL, isMatch) in zip(batch, matches) where isMatch {
+                guard !Task.isCancelled else { return true }
+                guard let content = try? String(contentsOf: fileURL, encoding: .utf8) else { continue }
+                for result in lineResults(in: content, of: fileURL, matching: query) {
+                    results.append(result)
+                    if results.count >= limit { return true }
+                }
+            }
+            return false
+        }
 
         for folder in folders {
+            // The dedup key is the file's standardized path, built from the
+            // root's: standardizing every file cost a stat per note.
+            let rootPath = folder.path
+            let standardRoot = folder.standardizedFileURL.path
+            func scanKey(_ fileURL: URL) -> String {
+                let path = fileURL.path
+                guard path.utf8.starts(with: rootPath.utf8) else { return fileURL.standardizedFileURL.path }
+                return standardRoot + String(decoding: path.utf8.dropFirst(rootPath.utf8.count), as: UTF8.self)
+            }
             guard let enumerator = FileManager.default.enumerator(
                 at: folder,
                 includingPropertiesForKeys: [.isRegularFileKey],
@@ -2319,43 +2353,65 @@ final class AppState {
                 guard let fileURL = object as? URL else { continue }
                 let ext = fileURL.pathExtension.lowercased()
                 guard ext == "md" || ext == "markdown" else { continue }
-                guard scanned.insert(fileURL.standardizedFileURL.path).inserted else { continue }
-
-                // One pass over the whole file rejects non-matching files
-                // without splitting or lowercasing a single line.
-                guard let content = try? String(contentsOf: fileURL, encoding: .utf8),
-                      content.range(of: query, options: .caseInsensitive) != nil else { continue }
-
-                // Lines are numbered as the editor shows the note: LF line
-                // breaks (a CRLF file's lines aren't doubled), and the body
-                // below the frontmatter block, which the editor leaves out.
-                // Raw file numbers put the caret as many lines too low as
-                // the block is tall. A match in the block is a property.
-                let text = FileService.normalizingLineEndings(content).text
-                let block = FileService.frontmatterBlock(in: text)
-                let propertyLines = block.map { text[$0.yaml].split(separator: "\n") } ?? []
-                let bodyLines = text[(block?.bodyStart ?? text.startIndex)...]
-                    .split(separator: "\n", omittingEmptySubsequences: false)
-                let lines = propertyLines.map { (number: Int?.none, text: $0) }
-                    + bodyLines.enumerated().map { (number: Int?.some($0.offset + 1), text: $0.element) }
-                for line in lines {
-                    guard !Task.isCancelled else { return [] }
-                    guard line.text.range(of: query, options: .caseInsensitive) != nil else { continue }
-                    let lineContent = String(line.text)
-                    // Ranged on the line itself (not a lowercased copy, whose
-                    // indices can differ) so matchRange indexes lineContent.
-                    guard let range = lineContent.range(of: query, options: .caseInsensitive) else { continue }
-                    results.append(SearchResult(
-                        fileURL: fileURL,
-                        lineNumber: line.number,
-                        lineContent: lineContent,
-                        matchRange: range
-                    ))
-                    if results.count >= limit { return results }
+                guard scanned.insert(scanKey(fileURL)).inserted else { continue }
+                batch.append(fileURL)
+                if batch.count >= batchSize, await drain() {
+                    return Task.isCancelled ? [] : results
                 }
             }
         }
+        if !batch.isEmpty { _ = await drain() }
+        return Task.isCancelled ? [] : results
+    }
 
+    /// Whether each file contains `query`, ignoring case, checked in parallel.
+    /// NSString runs the same comparison as `String.range(of:options:)` (which
+    /// calls it through a bridge), ~7× faster on a file read straight into it:
+    /// a whole-vault scan for a word in no note took 12 s through the bridge.
+    private static func filesContaining(_ query: String, in files: [URL]) async -> [Bool] {
+        await withTaskGroup(of: (Int, Bool).self) { group in
+            for (index, fileURL) in files.enumerated() {
+                group.addTask {
+                    guard !Task.isCancelled,
+                          let content = try? NSString(contentsOf: fileURL, encoding: String.Encoding.utf8.rawValue)
+                    else { return (index, false) }
+                    return (index, content.range(of: query, options: .caseInsensitive).location != NSNotFound)
+                }
+            }
+            var matches = [Bool](repeating: false, count: files.count)
+            for await (index, isMatch) in group { matches[index] = isMatch }
+            return matches
+        }
+    }
+
+    /// One result per line containing `query`. Lines are numbered as the
+    /// editor shows the note: LF line breaks (a CRLF file's lines aren't
+    /// doubled), and the body below the frontmatter block, which the editor
+    /// leaves out. Raw file numbers put the caret as many lines too low as
+    /// the block is tall. A match in the block is a property (no number).
+    private static func lineResults(in content: String, of fileURL: URL, matching query: String) -> [SearchResult] {
+        let text = FileService.normalizingLineEndings(content).text
+        let block = FileService.frontmatterBlock(in: text)
+        let propertyLines = block.map { text[$0.yaml].split(separator: "\n") } ?? []
+        let bodyLines = text[(block?.bodyStart ?? text.startIndex)...]
+            .split(separator: "\n", omittingEmptySubsequences: false)
+        let lines = propertyLines.map { (number: Int?.none, text: $0) }
+            + bodyLines.enumerated().map { (number: Int?.some($0.offset + 1), text: $0.element) }
+        var results: [SearchResult] = []
+        for line in lines {
+            if Task.isCancelled { return [] }
+            guard line.text.range(of: query, options: .caseInsensitive) != nil else { continue }
+            let lineContent = String(line.text)
+            // Ranged on the line itself (not a lowercased copy, whose
+            // indices can differ) so matchRange indexes lineContent.
+            guard let range = lineContent.range(of: query, options: .caseInsensitive) else { continue }
+            results.append(SearchResult(
+                fileURL: fileURL,
+                lineNumber: line.number,
+                lineContent: lineContent,
+                matchRange: range
+            ))
+        }
         return results
     }
 
