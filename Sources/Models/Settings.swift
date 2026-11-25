@@ -91,6 +91,8 @@ struct AppSettings: Codable, Equatable {
     var enableMermaid: Bool = true
     var enableKaTeX: Bool = false
     var enablePreviewCodeHighlight: Bool = true
+    /// The note's properties above its text in the preview, as in Obsidian.
+    var showPropertiesInPreview: Bool = true
     /// Obsidian's "Strict line breaks" (off by default there): off, a single
     /// newline inside a paragraph shows as a line break, as in Obsidian's
     /// reading view; on, it is a space (CommonMark / GitHub).
@@ -162,6 +164,7 @@ struct AppSettings: Codable, Equatable {
         enableKaTeX = (try? c.decodeIfPresent(Bool.self, forKey: .enableKaTeX)) ?? d.enableKaTeX
         enablePreviewCodeHighlight = (try? c.decodeIfPresent(Bool.self, forKey: .enablePreviewCodeHighlight)) ?? d.enablePreviewCodeHighlight
         strictLineBreaks = (try? c.decodeIfPresent(Bool.self, forKey: .strictLineBreaks)) ?? d.strictLineBreaks
+        showPropertiesInPreview = (try? c.decodeIfPresent(Bool.self, forKey: .showPropertiesInPreview)) ?? d.showPropertiesInPreview
         defaultVaultId = (try? c.decodeIfPresent(UUID.self, forKey: .defaultVaultId)) ?? d.defaultVaultId
         defaultSendFolder = (try? c.decodeIfPresent(String.self, forKey: .defaultSendFolder)) ?? d.defaultSendFolder
         conflictResolution = (try? c.decodeIfPresent(FileConflictResolution.self, forKey: .conflictResolution)) ?? d.conflictResolution

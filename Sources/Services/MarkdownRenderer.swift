@@ -402,6 +402,10 @@ struct MarkdownRenderOptions: Equatable {
     /// newline inside a paragraph is a line break. Off: CommonMark/GitHub,
     /// where it is a space.
     var obsidianLineBreaks: Bool = false
+    /// The note's properties block (`---` fences included), shown above the
+    /// text by `PropertiesRenderer`. Set for the live preview only
+    /// (`AppState.previewRenderOptions`); nil leaves exports as they were.
+    var properties: String? = nil
 }
 
 /// One parse configuration for every pass: no SmartyPants. cmark's smart
@@ -1680,6 +1684,7 @@ class MarkdownRenderer {
         let language = Self.documentLanguage(of: body)
         let langAttribute = language.map { " lang=\"\($0)\"" } ?? ""
         let callouts = PreviewStyles.callouts(in: body)
+        let properties = options.properties.map(PropertiesRenderer.html(block:)) ?? ""
 
         let head = """
         <!DOCTYPE html>
@@ -1698,6 +1703,7 @@ class MarkdownRenderer {
                 \(diagramCSS)
                 \(highlightBoxCSS)
                 \(includesKaTeX ? PreviewStyles.math : "")
+                \(properties.isEmpty ? "" : PropertiesRenderer.css)
                 \(settingsOverrideCSS(options.preview))
             </style>
             \(highlightIncludes)
@@ -1709,6 +1715,8 @@ class MarkdownRenderer {
         <body class="markdown-body">
         """
         var html = head + "\n    "
+        // Above the note and outside #cmdmd-root, so patches never count it.
+        if !properties.isEmpty { html += properties + "\n    " }
         var blocks: [Range<Int>]?
         if options.interactiveTasks {
             // The note in a box of its own (no layout box), so what scripts

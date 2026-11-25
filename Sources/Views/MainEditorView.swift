@@ -505,7 +505,7 @@ struct PreviewPane: View {
             positionKey: appState.currentDocument.map(ReadingPositions.key(for:)),
             source: PreviewSource(appState.currentDocument?.content ?? ""),
             baseURL: appState.currentDocument?.fileURL?.deletingLastPathComponent(),
-            options: appState.renderOptions(),
+            options: appState.previewRenderOptions(),
             scrollSyncEnabled: appState.settings.scrollSyncEnabled && appState.viewMode == .split,
             zoom: appState.settings.zoomLevel
         )

@@ -380,6 +380,8 @@ struct PreviewSettingsView: View {
             }
 
             Section("Obsidian Compatibility") {
+                Toggle("Show properties above the note", isOn: $state.settings.showPropertiesInPreview)
+                    .help("The note's frontmatter as a Properties block at the top of the preview, as in Obsidian")
                 Toggle("Wiki links [[...]] and #tags", isOn: $state.settings.enableWikiLinks)
                 Toggle("Callouts > [!note]", isOn: $state.settings.enableCallouts)
                 Toggle("Diagrams (Mermaid syntax, drawn by Pele)", isOn: $state.settings.enableMermaid)

@@ -173,6 +173,17 @@ struct MarkdownDocument: Identifiable, Equatable, Codable {
         return yaml + "\n\n" + content
     }
 
+    /// The properties block as `fullText` writes it (fences included), for
+    /// the preview's Properties; nil when the note has none. Read on every
+    /// render of the preview pane: a block read from the file comes back as
+    /// stored unless a property was edited.
+    var propertiesBlock: String? {
+        if let source = frontmatterSource { return source.text(for: frontmatter) }
+        guard let frontmatter else { return nil }
+        let yaml = frontmatter.toYAML()
+        return yaml.isEmpty ? nil : yaml
+    }
+
     /// `fullText.utf16.count` without assembling the full text, for the
     /// per-keystroke dirty check. `fullText` ends with the body, so only what
     /// precedes it is built, with a one-character stand-in for a non-empty

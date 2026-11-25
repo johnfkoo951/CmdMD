@@ -2161,6 +2161,16 @@ final class AppState {
     }
 
     /// The render configuration shared by the live preview and all exporters.
+    /// The live preview's options: the shared ones plus the current note's
+    /// properties block, which exports leave out.
+    func previewRenderOptions() -> MarkdownRenderOptions {
+        var options = renderOptions()
+        if settings.showPropertiesInPreview {
+            options.properties = currentDocument?.propertiesBlock
+        }
+        return options
+    }
+
     func renderOptions() -> MarkdownRenderOptions {
         MarkdownRenderOptions(
             theme: PreviewTheme(rawValue: settings.previewTheme) ?? .github,
